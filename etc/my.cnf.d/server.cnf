@@ -23,6 +23,13 @@
 # If you use the same .cnf file for MySQL and MariaDB,
 # you can put MariaDB-only options here
 [mariadb]
+log_output=FILE
+log_queries_not_using_indexes=ON
+general_log
+general_log_file=/var/log/mariadb/queries.log
+slow_query_log
+slow_query_log_file=/var/log/mariadb/slow.log
+long_query_time=0.1
 
 [mariadb-5.5]
 

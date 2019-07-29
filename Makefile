@@ -51,6 +51,8 @@ web-error: ## Show web server error log
 	sudo less +F ${WEB_ERROR_LOG}
 
 db-restart: ## Restart DB
+	sudo cp etc/my.cnf /etc/my.cnf
+	sudo cp etc/my.cnf.d/* /etc/my.cnf.d/
 	sudo systemctl restart ${DB_NAME}
 
 db-log: ## Show DB log
