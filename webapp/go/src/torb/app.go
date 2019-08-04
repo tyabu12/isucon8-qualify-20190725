@@ -231,25 +231,58 @@ func getEvents(all bool) ([]*Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	var events []*Event
+	var eventIds []interface{}
+	reservations := map[int64]map[int64]*Reservation{}
 	for rows.Next() {
 		var event Event
 		if err := rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		events = append(events, &event)
+		eventIds = append(eventIds, event.ID)
+		reservations[event.ID] = map[int64]*Reservation{}
 	}
-	for i, v := range events {
-		event, err := getEvent(v.ID, -1)
-		if err != nil {
+	rows.Close()
+	rows, err = tx.Query("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (?"+strings.Repeat(",?", len(eventIds)-1)+") and canceled_at IS NULL", eventIds...)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var reservation Reservation
+		if err := rows.Scan(&reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		for k := range event.Sheets {
-			event.Sheets[k].Detail = nil
+		reservations[reservation.EventID][reservation.SheetID] = &reservation
+	}
+	rows.Close()
+	sheets, err := getSheets()
+	if err != nil {
+		return nil, err
+	}
+	for _, event := range events {
+		event.Sheets = map[string]*Sheets{}
+		for rank, sheetsWithRank := range sheets {
+			event.Sheets[rank] = &Sheets{}
+			for _, sheetWithRank := range sheetsWithRank {
+				sheet := &Sheet{ID: sheetWithRank.ID, Rank: rank, Num: sheetWithRank.Num, Price: sheetWithRank.Price}
+				event.Sheets[rank].Price = event.Price + sheet.Price
+				event.Total++
+				event.Sheets[rank].Total++
+				reservation, ok := reservations[event.ID][sheet.ID]
+				if ok {
+					sheet.Mine = false
+					sheet.Reserved = true
+					sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
+				} else {
+					event.Remains++
+					event.Sheets[rank].Remains++
+				}
+				event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, sheet)
+			}
 		}
-		events[i] = event
 	}
 	return events, nil
 }
@@ -259,6 +292,23 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
 		return nil, err
 	}
+	reservations := map[int64]*Reservation{}
+	rows, err := db.Query("SELECT sheet_id, user_id, reserved_at FROM reservations WHERE event_id = ? AND canceled_at IS NULL", event.ID)
+	if err != nil {
+		if err != sql.ErrNoRows {
+			return nil, err
+		}
+	} else {
+		for rows.Next() {
+			var reservation Reservation
+			if err := rows.Scan(&reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			reservations[reservation.SheetID] = &reservation
+		}
+		rows.Close()
+	}
 	sheets, err := getSheets()
 	if err != nil {
 		return nil, err
@@ -267,30 +317,20 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	for rank, sheetsWithRank := range sheets {
 		event.Sheets[rank] = &Sheets{}
 		for _, sheetWithRank := range sheetsWithRank {
-			var sheet Sheet
-			sheet.ID = sheetWithRank.ID
-			sheet.Rank = sheetWithRank.Rank
-			sheet.Num = sheetWithRank.Num
-			sheet.Price = sheetWithRank.Price
-
+			sheet := &Sheet{ID: sheetWithRank.ID, Rank: rank, Num: sheetWithRank.Num, Price: sheetWithRank.Price}
 			event.Sheets[rank].Price = event.Price + sheet.Price
 			event.Total++
 			event.Sheets[rank].Total++
-
-			var reservation Reservation
-			err := db.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt)
-			if err == nil {
+			reservation, ok := reservations[sheet.ID]
+			if ok {
 				sheet.Mine = reservation.UserID == loginUserID
 				sheet.Reserved = true
 				sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
-			} else if err == sql.ErrNoRows {
+			} else {
 				event.Remains++
 				event.Sheets[rank].Remains++
-			} else {
-				return nil, err
 			}
-
-			event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, &sheet)
+			event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, sheet)
 		}
 	}
 
