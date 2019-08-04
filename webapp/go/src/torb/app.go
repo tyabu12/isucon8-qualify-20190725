@@ -193,7 +193,13 @@ func getEvents(all bool) ([]*Event, error) {
 	}
 	defer tx.Commit()
 
-	rows, err := tx.Query("SELECT * FROM events ORDER BY id ASC")
+	var sql string
+	if all {
+		sql = "SELECT * FROM events ORDER BY id ASC"
+	} else {
+		sql = "SELECT * FROM events WHERE public_fg = 1 ORDER BY id ASC"
+	}
+	rows, err := tx.Query(sql)
 	if err != nil {
 		return nil, err
 	}
@@ -204,9 +210,6 @@ func getEvents(all bool) ([]*Event, error) {
 		var event Event
 		if err := rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
 			return nil, err
-		}
-		if !all && !event.PublicFg {
-			continue
 		}
 		events = append(events, &event)
 	}
