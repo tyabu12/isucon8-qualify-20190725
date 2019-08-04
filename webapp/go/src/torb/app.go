@@ -86,6 +86,34 @@ type Administrator struct {
 	PassHash  string `json:"pass_hash,omitempty"`
 }
 
+var (
+	sheetsCache map[string][]*Sheet
+)
+
+func getSheets() (map[string][]*Sheet, error) {
+	if sheetsCache == nil {
+		sheetsCache = map[string][]*Sheet{
+			"A": []*Sheet{},
+			"B": []*Sheet{},
+			"C": []*Sheet{},
+			"S": []*Sheet{},
+		}
+		rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var sheet Sheet
+			if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+				return nil, err
+			}
+			sheetsCache[sheet.Rank] = append(sheetsCache[sheet.Rank], &sheet)
+		}
+	}
+	return sheetsCache, nil
+}
+
 func sessUserID(c echo.Context) int64 {
 	sess, _ := session.Get("session", c)
 	var userID int64
@@ -231,42 +259,39 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
 		return nil, err
 	}
-	event.Sheets = map[string]*Sheets{
-		"S": &Sheets{},
-		"A": &Sheets{},
-		"B": &Sheets{},
-		"C": &Sheets{},
-	}
-
-	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+	sheets, err := getSheets()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	event.Sheets = map[string]*Sheets{}
+	for rank, sheetsWithRank := range sheets {
+		event.Sheets[rank] = &Sheets{}
+		for _, sheetWithRank := range sheetsWithRank {
+			var sheet Sheet
+			sheet.ID = sheetWithRank.ID
+			sheet.Rank = sheetWithRank.Rank
+			sheet.Num = sheetWithRank.Num
+			sheet.Price = sheetWithRank.Price
 
-	for rows.Next() {
-		var sheet Sheet
-		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-			return nil, err
+			event.Sheets[rank].Price = event.Price + sheet.Price
+			event.Total++
+			event.Sheets[rank].Total++
+
+			var reservation Reservation
+			err := db.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt)
+			if err == nil {
+				sheet.Mine = reservation.UserID == loginUserID
+				sheet.Reserved = true
+				sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
+			} else if err == sql.ErrNoRows {
+				event.Remains++
+				event.Sheets[rank].Remains++
+			} else {
+				return nil, err
+			}
+
+			event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, &sheet)
 		}
-		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
-		event.Total++
-		event.Sheets[sheet.Rank].Total++
-
-		var reservation Reservation
-		err := db.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt)
-		if err == nil {
-			sheet.Mine = reservation.UserID == loginUserID
-			sheet.Reserved = true
-			sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
-		} else if err == sql.ErrNoRows {
-			event.Remains++
-			event.Sheets[sheet.Rank].Remains++
-		} else {
-			return nil, err
-		}
-
-		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &sheet)
 	}
 
 	return &event, nil
@@ -299,9 +324,15 @@ func fillinAdministrator(next echo.HandlerFunc) echo.HandlerFunc {
 }
 
 func validateRank(rank string) bool {
-	var count int
-	db.QueryRow("SELECT COUNT(*) FROM sheets WHERE `rank` = ?", rank).Scan(&count)
-	return count > 0
+	sheets, err := getSheets()
+	if err != nil {
+		return false
+	}
+	sheetsWithRank, ok := sheets[rank]
+	if !ok {
+		return false
+	}
+	return len(sheetsWithRank) > 0
 }
 
 type Renderer struct {
@@ -365,6 +396,11 @@ func main() {
 		err := cmd.Run()
 		if err != nil {
 			return nil
+		}
+
+		// create sheets cache
+		if _, err = getSheets(); err != nil {
+			return err
 		}
 
 		return c.NoContent(204)
