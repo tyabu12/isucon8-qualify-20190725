@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -89,6 +90,10 @@ type Administrator struct {
 var (
 	sheetsCache map[string][]*Sheet
 )
+
+func calcPassHash(password string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
+}
 
 func getSheets() (map[string][]*Sheet, error) {
 	if sheetsCache == nil {
@@ -467,7 +472,7 @@ func main() {
 			return err
 		}
 
-		res, err := tx.Exec("INSERT INTO users (login_name, pass_hash, nickname) VALUES (?, SHA2(?, 256), ?)", params.LoginName, params.Password, params.Nickname)
+		res, err := tx.Exec("INSERT INTO users (login_name, pass_hash, nickname) VALUES (?, ?, ?)", params.LoginName, calcPassHash(params.Password), params.Nickname)
 		if err != nil {
 			tx.Rollback()
 			return resError(c, "", 0)
@@ -590,11 +595,7 @@ func main() {
 			return err
 		}
 
-		var passHash string
-		if err := db.QueryRow("SELECT SHA2(?, 256)", params.Password).Scan(&passHash); err != nil {
-			return err
-		}
-		if user.PassHash != passHash {
+		if user.PassHash != calcPassHash(params.Password) {
 			return resError(c, "authentication_failed", 401)
 		}
 
@@ -805,11 +806,7 @@ func main() {
 			return err
 		}
 
-		var passHash string
-		if err := db.QueryRow("SELECT SHA2(?, 256)", params.Password).Scan(&passHash); err != nil {
-			return err
-		}
-		if administrator.PassHash != passHash {
+		if administrator.PassHash != calcPassHash(params.Password) {
 			return resError(c, "authentication_failed", 401)
 		}
 
