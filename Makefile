@@ -11,6 +11,7 @@ DB_LOG = /var/log/${DB_NAME}/${DB_NAME}.log
 DB_ERROR_LOG = /var/log/${DB_NAME}/error.log
 DB_SLOW_LOG = /var/log/${DB_NAME}/slow.log
 
+KVS_NAME = redis
 
 .DEFAULT_GOAL := help
 
@@ -63,6 +64,12 @@ db-error: ## Show DB error log
 
 db-slow: ## Show DB slow log
 	sudo pt-query-digest ${DB_SLOW_LOG}
+
+kvs-restart: ## Restart KVS
+	sudo systemctl restart ${KVS_NAME}
+
+kvs-log:  ## Show KVS log
+	sudo journalctl -u ${KVS_NAME}
 
 .PHONY: help
 help:
