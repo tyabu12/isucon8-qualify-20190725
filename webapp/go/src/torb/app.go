@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/garyburd/redigo/redis"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/labstack/echo"
@@ -89,10 +91,63 @@ type Administrator struct {
 
 var (
 	sheetsCache map[string]map[int64]*Sheet
+	kvsPool     *redis.Pool
+
+	sheetsMap = map[string]int64{
+		"S": 50,
+		"A": 150,
+		"B": 300,
+		"C": 500,
+	}
+	priceMap = map[string]int64{
+		"S": 5000,
+		"A": 3000,
+		"B": 1000,
+		"C": 0,
+	}
 )
 
 func calcPassHash(password string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
+}
+
+func getKvsKeyForFreeSheets(eventID int64, rank string) string {
+	return fmt.Sprintf("freeSheets:%d:%s", eventID, rank)
+}
+
+func newKvsPool(addr string) *redis.Pool {
+	return &redis.Pool{
+		MaxIdle:     5,
+		IdleTimeout: 240 * time.Second,
+		// Dial or DialContext must be set. When both are set, DialContext takes precedence over Dial.
+		Dial: func() (redis.Conn, error) {
+			c, err := redis.Dial("tcp", addr)
+			if err != nil {
+				panic(err.Error())
+			}
+			return c, err
+		},
+	}
+}
+
+func initEventStates(kvs redis.Conn, events []*Event) error {
+	for rank, sheetsByRank := range getSheetsSortedByNum() {
+		sheetsByRankShuffle := make([]*Sheet, len(sheetsByRank))
+		for _, event := range events {
+			copy(sheetsByRankShuffle, sheetsByRank)
+			rand.Shuffle(len(sheetsByRankShuffle), func(i, j int) {
+				sheetsByRankShuffle[i], sheetsByRankShuffle[j] = sheetsByRankShuffle[j], sheetsByRankShuffle[i]
+			})
+			args := redis.Args{}.Add(getKvsKeyForFreeSheets(event.ID, rank))
+			for _, s := range sheetsByRankShuffle {
+				args = args.Add(s.Num)
+			}
+			if _, err := kvs.Do("LPUSH", args...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func initSheetsCache() error {
@@ -422,6 +477,9 @@ func main() {
 		log.Fatal(err)
 	}
 
+	kvsAddr := fmt.Sprintf("%s:%s", os.Getenv("KVS_HOST"), os.Getenv("KVS_PORT"))
+	kvsPool = newKvsPool(kvsAddr)
+
 	e := echo.New()
 	funcs := template.FuncMap{
 		"encode_json": func(v interface{}) string {
@@ -450,6 +508,10 @@ func main() {
 		})
 	}, fillinUser)
 	e.GET("/initialize", func(c echo.Context) error {
+		kvs := kvsPool.Get()
+		defer kvs.Close()
+		kvs.Do("FLUSHALL")
+
 		cmd := exec.Command("../../db/init.sh")
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
@@ -461,6 +523,42 @@ func main() {
 		if err = initSheetsCache(); err != nil {
 			return err
 		}
+
+		events := []*Event{}
+		rows, err := db.Query("SELECT * FROM events")
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var event Event
+			if err := rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
+				rows.Close()
+				return err
+			}
+			events = append(events, &event)
+		}
+		rows.Close()
+		if err = initEventStates(kvs, events); err != nil {
+			return err
+		}
+		rows, err = db.Query("SELECT event_id, rank, num FROM reservations r INNER JOIN sheets s ON r.sheet_id = s.id WHERE canceled_at IS NULL")
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var eventID, num int64
+			var rank string
+			if err = rows.Scan(&eventID, &rank, &num); err != nil {
+				rows.Close()
+				return err
+			}
+			_, err = kvs.Do("LREM", getKvsKeyForFreeSheets(eventID, rank), 0, num)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+		}
+		rows.Close()
 
 		return c.NoContent(204)
 	})
@@ -478,7 +576,7 @@ func main() {
 		}
 
 		var user User
-		if err := tx.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.LoginName, &user.Nickname, &user.PassHash); err != sql.ErrNoRows {
+		if err := tx.QueryRow("SELECT * FROM users WHERE login_name = ? FOR UPDATE", params.LoginName).Scan(&user.ID, &user.LoginName, &user.Nickname, &user.PassHash); err != sql.ErrNoRows {
 			tx.Rollback()
 			if err == nil {
 				return resError(c, "duplicated", 409)
@@ -685,43 +783,39 @@ func main() {
 			return resError(c, "invalid_rank", 400)
 		}
 
-		var sheet Sheet
-		var reservationID int64
-		for {
-			tx, err := db.Begin()
-			if err != nil {
-				return err
-			}
+		kvs := kvsPool.Get()
+		defer kvs.Close()
 
-			if err := tx.QueryRow("SELECT * FROM sheets WHERE id NOT IN (SELECT sheet_id FROM reservations WHERE event_id = ? AND canceled_at IS NULL FOR UPDATE) AND `rank` = ? ORDER BY RAND() LIMIT 1", event.ID, params.Rank).Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-				tx.Rollback()
-				log.Println("rollback by", err)
-				if err == sql.ErrNoRows {
-					return resError(c, "sold_out", 409)
-				}
-				return err
-			}
-
-			res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
-			if err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
-			}
-			reservationID, err = res.LastInsertId()
-			if err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
-			}
-			if err := tx.Commit(); err != nil {
-				tx.Rollback()
-				log.Println("re-try: rollback by", err)
-				continue
-			}
-
-			break
+		tx, err := db.Begin()
+		if err != nil {
+			return err
 		}
+		num, err := redis.Int64(kvs.Do("LPOP", getKvsKeyForFreeSheets(event.ID, params.Rank)))
+		if err != nil {
+			tx.Rollback()
+			if err == redis.ErrNil {
+				return resError(c, "sold_out", 409)
+			}
+			return err
+		}
+		sheet := getSheets()[params.Rank][num]
+		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
+		if err != nil {
+			tx.Rollback()
+			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
+			return err
+		}
+		reservationID, err := res.LastInsertId()
+		if err != nil {
+			tx.Rollback()
+			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
+			return err
+		}
+
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
 			"sheet_rank": params.Rank,
@@ -763,6 +857,9 @@ func main() {
 			return err
 		}
 
+		kvs := kvsPool.Get()
+		defer kvs.Close()
+
 		tx, err := db.Begin()
 		if err != nil {
 			return err
@@ -781,12 +878,19 @@ func main() {
 			return resError(c, "not_permitted", 403)
 		}
 
-		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
+		if _, err := kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, sheet.Rank), sheet.Num); err != nil {
 			tx.Rollback()
 			return err
 		}
 
+		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
+			tx.Rollback()
+			kvs.Do("RPOP", getKvsKeyForFreeSheets(event.ID, sheet.Rank))
+			return err
+		}
+
 		if err := tx.Commit(); err != nil {
+			kvs.Do("RPOP", getKvsKeyForFreeSheets(event.ID, sheet.Rank))
 			return err
 		}
 
@@ -851,6 +955,22 @@ func main() {
 			Price  int    `json:"price"`
 		}
 		c.Bind(&params)
+		event := &Event{
+			Title:    params.Title,
+			PublicFg: params.Public,
+			ClosedFg: false,
+			Price:    int64(params.Price),
+			Total:    1000,
+			Remains:  1000,
+			Sheets:   map[string]*Sheets{},
+		}
+		for rank := range getSheets() {
+			event.Sheets[rank] = &Sheets{
+				Total:   int(sheetsMap[rank]),
+				Remains: int(sheetsMap[rank]),
+				Price:   event.Price + priceMap[rank],
+			}
+		}
 
 		tx, err := db.Begin()
 		if err != nil {
@@ -862,20 +982,18 @@ func main() {
 			tx.Rollback()
 			return err
 		}
-		eventID, err := res.LastInsertId()
+		event.ID, err = res.LastInsertId()
 		if err != nil {
 			tx.Rollback()
 			return err
 		}
+		kvs := kvsPool.Get()
+		initEventStates(kvs, []*Event{event})
 		if err := tx.Commit(); err != nil {
 			return err
 		}
 
-		event, err := getEvent(eventID, -1)
-		if err != nil {
-			return err
-		}
-		return c.JSON(200, event)
+		return c.JSON(200, *event)
 	}, adminLoginRequired)
 	e.GET("/admin/api/events/:id", func(c echo.Context) error {
 		eventID, err := strconv.ParseInt(c.Param("id"), 10, 64)
