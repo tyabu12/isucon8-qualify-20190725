@@ -88,35 +88,62 @@ type Administrator struct {
 }
 
 var (
-	sheetsCache map[string][]*Sheet
+	sheetsCache map[string]map[int64]*Sheet
 )
 
 func calcPassHash(password string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
 }
 
-func getSheets() (map[string][]*Sheet, error) {
+func initSheetsCache() error {
+	sheetsCache = map[string]map[int64]*Sheet{
+		"A": map[int64]*Sheet{},
+		"B": map[int64]*Sheet{},
+		"C": map[int64]*Sheet{},
+		"S": map[int64]*Sheet{},
+	}
+	rows, err := db.Query("SELECT * FROM sheets order by `rank`, num")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sheet Sheet
+		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+			return err
+		}
+		sheetsCache[sheet.Rank][sheet.Num] = &sheet
+	}
+	return nil
+}
+
+func getSheets() map[string]map[int64]*Sheet {
 	if sheetsCache == nil {
-		sheetsCache = map[string][]*Sheet{
-			"A": []*Sheet{},
-			"B": []*Sheet{},
-			"C": []*Sheet{},
-			"S": []*Sheet{},
-		}
-		rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var sheet Sheet
-			if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
-				return nil, err
-			}
-			sheetsCache[sheet.Rank] = append(sheetsCache[sheet.Rank], &sheet)
+		if err := initSheetsCache(); err != nil {
+			panic(err)
 		}
 	}
-	return sheetsCache, nil
+	return sheetsCache
+}
+
+func getSheetsSortedByNum() map[string][]*Sheet {
+	sheets := map[string][]*Sheet{}
+	for rank, sheetsByRank := range getSheets() {
+		sheets[rank] = make([]*Sheet, len(sheetsByRank))
+		nums := make([]int64, len(sheetsByRank))
+		i := 0
+		for num := range sheetsByRank {
+			nums[i] = num
+			i++
+		}
+		sort.Slice(nums, func(i, j int) bool {
+			return nums[i] < nums[j]
+		})
+		for i, num := range nums {
+			sheets[rank][i] = sheetsByRank[num]
+		}
+	}
+	return sheets
 }
 
 func sessUserID(c echo.Context) int64 {
@@ -263,29 +290,25 @@ func getEvents(all bool) ([]*Event, error) {
 		reservations[reservation.EventID][reservation.SheetID] = &reservation
 	}
 	rows.Close()
-	sheets, err := getSheets()
-	if err != nil {
-		return nil, err
-	}
 	for _, event := range events {
 		event.Sheets = map[string]*Sheets{}
-		for rank, sheetsWithRank := range sheets {
+		for rank, sheetsByRank := range getSheetsSortedByNum() {
 			event.Sheets[rank] = &Sheets{}
-			for _, sheetWithRank := range sheetsWithRank {
-				sheet := &Sheet{ID: sheetWithRank.ID, Rank: rank, Num: sheetWithRank.Num, Price: sheetWithRank.Price}
-				event.Sheets[rank].Price = event.Price + sheet.Price
+			for _, sheet := range sheetsByRank {
+				s := &Sheet{ID: sheet.ID, Rank: rank, Num: sheet.Num, Price: sheet.Price}
+				event.Sheets[rank].Price = event.Price + s.Price
 				event.Total++
 				event.Sheets[rank].Total++
 				reservation, ok := reservations[event.ID][sheet.ID]
 				if ok {
-					sheet.Mine = false
-					sheet.Reserved = true
-					sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
+					s.Mine = false
+					s.Reserved = true
+					s.ReservedAtUnix = reservation.ReservedAt.Unix()
 				} else {
 					event.Remains++
 					event.Sheets[rank].Remains++
 				}
-				event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, sheet)
+				event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, s)
 			}
 		}
 	}
@@ -314,28 +337,24 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		}
 		rows.Close()
 	}
-	sheets, err := getSheets()
-	if err != nil {
-		return nil, err
-	}
 	event.Sheets = map[string]*Sheets{}
-	for rank, sheetsWithRank := range sheets {
+	for rank, sheetsByRank := range getSheetsSortedByNum() {
 		event.Sheets[rank] = &Sheets{}
-		for _, sheetWithRank := range sheetsWithRank {
-			sheet := &Sheet{ID: sheetWithRank.ID, Rank: rank, Num: sheetWithRank.Num, Price: sheetWithRank.Price}
-			event.Sheets[rank].Price = event.Price + sheet.Price
+		for _, sheet := range sheetsByRank {
+			s := &Sheet{ID: sheet.ID, Rank: rank, Num: sheet.Num, Price: sheet.Price}
+			event.Sheets[rank].Price = event.Price + s.Price
 			event.Total++
 			event.Sheets[rank].Total++
 			reservation, ok := reservations[sheet.ID]
 			if ok {
-				sheet.Mine = reservation.UserID == loginUserID
-				sheet.Reserved = true
-				sheet.ReservedAtUnix = reservation.ReservedAt.Unix()
+				s.Mine = reservation.UserID == loginUserID
+				s.Reserved = true
+				s.ReservedAtUnix = reservation.ReservedAt.Unix()
 			} else {
 				event.Remains++
 				event.Sheets[rank].Remains++
 			}
-			event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, sheet)
+			event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, s)
 		}
 	}
 
@@ -369,15 +388,11 @@ func fillinAdministrator(next echo.HandlerFunc) echo.HandlerFunc {
 }
 
 func validateRank(rank string) bool {
-	sheets, err := getSheets()
-	if err != nil {
-		return false
-	}
-	sheetsWithRank, ok := sheets[rank]
+	sheetsByRank, ok := getSheets()[rank]
 	if !ok {
 		return false
 	}
-	return len(sheetsWithRank) > 0
+	return len(sheetsByRank) > 0
 }
 
 type Renderer struct {
@@ -443,8 +458,7 @@ func main() {
 			return nil
 		}
 
-		// create sheets cache
-		if _, err = getSheets(); err != nil {
+		if err = initSheetsCache(); err != nil {
 			return err
 		}
 
