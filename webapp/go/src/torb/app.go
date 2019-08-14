@@ -90,10 +90,13 @@ type Administrator struct {
 }
 
 var (
-	sheetsCache map[string]map[int64]*Sheet
-	kvsPool     *redis.Pool
+	sheetsMapById              []*Sheet
+	sheetsMapByRankAndNum      map[string]map[int64]*Sheet
+	sheetsMapByRankSortedByNum map[string][]*Sheet
+	kvsPool                    *redis.Pool
 
-	sheetsMap = map[string]int64{
+	sheetsRanks = []string{"S", "A", "B", "C"}
+	sheetsMap   = map[string]int64{
 		"S": 50,
 		"A": 150,
 		"B": 300,
@@ -131,7 +134,7 @@ func newKvsPool(addr string) *redis.Pool {
 }
 
 func initEventStates(kvs redis.Conn, events []*Event) error {
-	for rank, sheetsByRank := range getSheetsSortedByNum() {
+	for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
 		sheetsByRankShuffle := make([]*Sheet, len(sheetsByRank))
 		for _, event := range events {
 			copy(sheetsByRankShuffle, sheetsByRank)
@@ -151,12 +154,8 @@ func initEventStates(kvs redis.Conn, events []*Event) error {
 }
 
 func initSheetsCache() error {
-	sheetsCache = map[string]map[int64]*Sheet{
-		"A": map[int64]*Sheet{},
-		"B": map[int64]*Sheet{},
-		"C": map[int64]*Sheet{},
-		"S": map[int64]*Sheet{},
-	}
+	sheetsMapById = make([]*Sheet, 1001)
+	sheetsMapByRankAndNum = map[string]map[int64]*Sheet{}
 	rows, err := db.Query("SELECT * FROM sheets order by `rank`, num")
 	if err != nil {
 		return err
@@ -167,24 +166,16 @@ func initSheetsCache() error {
 		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
 			return err
 		}
-		sheetsCache[sheet.Rank][sheet.Num] = &sheet
-	}
-	return nil
-}
-
-func getSheets() map[string]map[int64]*Sheet {
-	if sheetsCache == nil {
-		if err := initSheetsCache(); err != nil {
-			panic(err)
+		sheetsMapById[sheet.ID] = &sheet
+		if sheetsMapByRankAndNum[sheet.Rank] == nil {
+			sheetsMapByRankAndNum[sheet.Rank] = map[int64]*Sheet{}
 		}
+		sheetsMapByRankAndNum[sheet.Rank][sheet.Num] = &sheet
 	}
-	return sheetsCache
-}
 
-func getSheetsSortedByNum() map[string][]*Sheet {
-	sheets := map[string][]*Sheet{}
-	for rank, sheetsByRank := range getSheets() {
-		sheets[rank] = make([]*Sheet, len(sheetsByRank))
+	sheetsMapByRankSortedByNum = map[string][]*Sheet{}
+	for rank, sheetsByRank := range sheetsMapByRankAndNum {
+		sheetsMapByRankSortedByNum[rank] = make([]*Sheet, len(sheetsByRank))
 		nums := make([]int64, len(sheetsByRank))
 		i := 0
 		for num := range sheetsByRank {
@@ -195,10 +186,11 @@ func getSheetsSortedByNum() map[string][]*Sheet {
 			return nums[i] < nums[j]
 		})
 		for i, num := range nums {
-			sheets[rank][i] = sheetsByRank[num]
+			sheetsMapByRankSortedByNum[rank][i] = sheetsByRank[num]
 		}
 	}
-	return sheets
+
+	return nil
 }
 
 func sessUserID(c echo.Context) int64 {
@@ -347,7 +339,7 @@ func getEvents(all bool) ([]*Event, error) {
 	rows.Close()
 	for _, event := range events {
 		event.Sheets = map[string]*Sheets{}
-		for rank, sheetsByRank := range getSheetsSortedByNum() {
+		for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
 			event.Sheets[rank] = &Sheets{}
 			for _, sheet := range sheetsByRank {
 				s := &Sheet{ID: sheet.ID, Rank: rank, Num: sheet.Num, Price: sheet.Price}
@@ -393,7 +385,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		rows.Close()
 	}
 	event.Sheets = map[string]*Sheets{}
-	for rank, sheetsByRank := range getSheetsSortedByNum() {
+	for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
 		event.Sheets[rank] = &Sheets{}
 		for _, sheet := range sheetsByRank {
 			s := &Sheet{ID: sheet.ID, Rank: rank, Num: sheet.Num, Price: sheet.Price}
@@ -443,7 +435,7 @@ func fillinAdministrator(next echo.HandlerFunc) echo.HandlerFunc {
 }
 
 func validateRank(rank string) bool {
-	sheetsByRank, ok := getSheets()[rank]
+	sheetsByRank, ok := sheetsMapByRankAndNum[rank]
 	if !ok {
 		return false
 	}
@@ -541,18 +533,18 @@ func main() {
 		if err = initEventStates(kvs, events); err != nil {
 			return err
 		}
-		rows, err = db.Query("SELECT event_id, rank, num FROM reservations r INNER JOIN sheets s ON r.sheet_id = s.id WHERE canceled_at IS NULL")
+		rows, err = db.Query("SELECT event_id, sheet_id FROM reservations WHERE canceled_at IS NULL")
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
-			var eventID, num int64
-			var rank string
-			if err = rows.Scan(&eventID, &rank, &num); err != nil {
+			var eventID, sheetID int64
+			if err = rows.Scan(&eventID, &sheetID); err != nil {
 				rows.Close()
 				return err
 			}
-			_, err = kvs.Do("LREM", getKvsKeyForFreeSheets(eventID, rank), 0, num)
+			sheet := sheetsMapById[sheetID]
+			_, err = kvs.Do("LREM", getKvsKeyForFreeSheets(eventID, sheet.Rank), 0, sheet.Num)
 			if err != nil {
 				rows.Close()
 				return err
@@ -798,7 +790,7 @@ func main() {
 			}
 			return err
 		}
-		sheet := getSheets()[params.Rank][num]
+		sheet := sheetsMapByRankAndNum[params.Rank][num]
 		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
 		if err != nil {
 			tx.Rollback()
@@ -964,7 +956,7 @@ func main() {
 			Remains:  1000,
 			Sheets:   map[string]*Sheets{},
 		}
-		for rank := range getSheets() {
+		for _, rank := range sheetsRanks {
 			event.Sheets[rank] = &Sheets{
 				Total:   int(sheetsMap[rank]),
 				Remains: int(sheetsMap[rank]),
