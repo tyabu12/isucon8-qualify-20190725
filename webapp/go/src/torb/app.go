@@ -90,10 +90,7 @@ type Administrator struct {
 }
 
 var (
-	sheetsMapById              []*Sheet
-	sheetsMapByRankAndNum      map[string]map[int64]*Sheet
-	sheetsMapByRankSortedByNum map[string][]*Sheet
-	kvsPool                    *redis.Pool
+	kvsPool *redis.Pool
 
 	sheetsRanks = []string{"S", "A", "B", "C"}
 	sheetsMap   = map[string]int64{
@@ -108,6 +105,9 @@ var (
 		"B": 1000,
 		"C": 0,
 	}
+	sheetsMapById              []*Sheet
+	sheetsMapByRankAndNum      map[string]map[int64]*Sheet
+	sheetsMapByRankSortedByNum map[string][]*Sheet
 )
 
 func calcPassHash(password string) string {
@@ -116,6 +116,10 @@ func calcPassHash(password string) string {
 
 func getKvsKeyForFreeSheets(eventID int64, rank string) string {
 	return fmt.Sprintf("freeSheets:%d:%s", eventID, rank)
+}
+
+func getKvsKeyForEvent(eventID int64) string {
+	return fmt.Sprintf("event:%d", eventID)
 }
 
 func newKvsPool(addr string) *redis.Pool {
@@ -134,6 +138,17 @@ func newKvsPool(addr string) *redis.Pool {
 }
 
 func initEventStates(kvs redis.Conn, events []*Event) error {
+	args := redis.Args{}
+	for _, event := range events {
+		eventJson, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+		args = args.Add(getKvsKeyForEvent(event.ID)).Add(eventJson)
+	}
+	if _, err := kvs.Do("MSET", args...); err != nil {
+		return err
+	}
 	for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
 		sheetsByRankShuffle := make([]*Sheet, len(sheetsByRank))
 		for _, event := range events {
@@ -141,7 +156,7 @@ func initEventStates(kvs redis.Conn, events []*Event) error {
 			rand.Shuffle(len(sheetsByRankShuffle), func(i, j int) {
 				sheetsByRankShuffle[i], sheetsByRankShuffle[j] = sheetsByRankShuffle[j], sheetsByRankShuffle[i]
 			})
-			args := redis.Args{}.Add(getKvsKeyForFreeSheets(event.ID, rank))
+			args = redis.Args{}.Add(getKvsKeyForFreeSheets(event.ID, rank))
 			for _, s := range sheetsByRankShuffle {
 				args = args.Add(s.Num)
 			}
@@ -332,6 +347,8 @@ func getEvents(all bool) ([]*Event, error) {
 	}
 	rows.Close()
 	for _, event := range events {
+		event.Total = 0
+		event.Remains = 0
 		event.Sheets = map[string]*Sheets{}
 		for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
 			event.Sheets[rank] = &Sheets{}
@@ -356,9 +373,23 @@ func getEvents(all bool) ([]*Event, error) {
 	return events, nil
 }
 
-func getEvent(eventID, loginUserID int64) (*Event, error) {
+func getBaseEvent(eventID int64) (*Event, error) {
+	kvs := kvsPool.Get()
+	defer kvs.Close()
+	eventJson, err := redis.String(kvs.Do("GET", getKvsKeyForEvent(eventID)))
+	if err != nil {
+		return nil, err
+	}
 	var event Event
-	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
+	if err = json.Unmarshal([]byte(eventJson), &event); err != nil {
+		return nil, err
+	}
+	return &event, nil
+}
+
+func getEvent(eventID, loginUserID int64) (*Event, error) {
+	event, err := getBaseEvent(eventID)
+	if err != nil {
 		return nil, err
 	}
 	reservations := map[int64]*Reservation{}
@@ -378,6 +409,8 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		}
 		rows.Close()
 	}
+	event.Total = 0
+	event.Remains = 0
 	event.Sheets = map[string]*Sheets{}
 	for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
 		event.Sheets[rank] = &Sheets{}
@@ -399,7 +432,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		}
 	}
 
-	return &event, nil
+	return event, nil
 }
 
 func sanitizeEvent(e *Event) *Event {
@@ -731,7 +764,7 @@ func main() {
 
 		event, err := getEvent(eventID, loginUserID)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "not_found", 404)
 			}
 			return err
@@ -755,9 +788,9 @@ func main() {
 			return err
 		}
 
-		event, err := getEvent(eventID, user.ID)
+		event, err := getBaseEvent(eventID)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "invalid_event", 404)
 			}
 			return err
@@ -824,9 +857,9 @@ func main() {
 			return err
 		}
 
-		event, err := getEvent(eventID, user.ID)
+		event, err := getBaseEvent(eventID)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "invalid_event", 404)
 			}
 			return err
@@ -958,6 +991,9 @@ func main() {
 			}
 		}
 
+		kvs := kvsPool.Get()
+		defer kvs.Close()
+
 		tx, err := db.Begin()
 		if err != nil {
 			return err
@@ -973,8 +1009,10 @@ func main() {
 			tx.Rollback()
 			return err
 		}
-		kvs := kvsPool.Get()
-		initEventStates(kvs, []*Event{event})
+		if err := initEventStates(kvs, []*Event{event}); err != nil {
+			tx.Rollback()
+			return err
+		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -988,7 +1026,7 @@ func main() {
 		}
 		event, err := getEvent(eventID, -1)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "not_found", 404)
 			}
 			return err
@@ -1010,9 +1048,9 @@ func main() {
 			params.Public = false
 		}
 
-		event, err := getEvent(eventID, -1)
+		event, err := getBaseEvent(eventID)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "not_found", 404)
 			}
 			return err
@@ -1027,11 +1065,22 @@ func main() {
 		event.PublicFg = params.Public
 		event.ClosedFg = params.Closed
 
+		kvs := kvsPool.Get()
+		defer kvs.Close()
+		eventJson, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+
 		tx, err := db.Begin()
 		if err != nil {
 			return err
 		}
 		if _, err := tx.Exec("UPDATE events SET public_fg = ?, closed_fg = ? WHERE id = ?", event.PublicFg, event.ClosedFg, event.ID); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err := kvs.Do("SET", getKvsKeyForEvent(event.ID), eventJson); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -1048,7 +1097,7 @@ func main() {
 			return resError(c, "not_found", 404)
 		}
 
-		event, err := getEvent(eventID, -1)
+		event, err := getBaseEvent(eventID)
 		if err != nil {
 			return err
 		}
