@@ -1059,7 +1059,7 @@ func main() {
 			return err
 		}
 
-		rows, err := db.Query("SELECT * FROM reservations WHERE event_id = ? ORDER BY reserved_at ASC", event.ID)
+		rows, err := db.Query("SELECT * FROM reservations WHERE event_id = ? ORDER BY id ASC", event.ID)
 		if err != nil {
 			return err
 		}
@@ -1089,7 +1089,7 @@ func main() {
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		rows, err := db.Query("SELECT r.*, e.price AS event_price FROM reservations r INNER JOIN events e ON e.id = r.event_id ORDER BY reserved_at ASC")
+		rows, err := db.Query("SELECT r.*, e.price AS event_price FROM reservations r INNER JOIN events e ON e.id = r.event_id ORDER BY id ASC")
 		if err != nil {
 			return err
 		}
