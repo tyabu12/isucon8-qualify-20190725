@@ -294,19 +294,13 @@ func getLoginAdministrator(c echo.Context) (*Administrator, error) {
 }
 
 func getEvents(all bool) ([]*Event, error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Commit()
-
 	var sql string
 	if all {
 		sql = "SELECT * FROM events ORDER BY id ASC"
 	} else {
 		sql = "SELECT * FROM events WHERE public_fg = 1 ORDER BY id ASC"
 	}
-	rows, err := tx.Query(sql)
+	rows, err := db.Query(sql)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +318,7 @@ func getEvents(all bool) ([]*Event, error) {
 		reservations[event.ID] = map[int64]*Reservation{}
 	}
 	rows.Close()
-	rows, err = tx.Query("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (?"+strings.Repeat(",?", len(eventIds)-1)+") and canceled_at IS NULL", eventIds...)
+	rows, err = db.Query("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (?"+strings.Repeat(",?", len(eventIds)-1)+") and canceled_at IS NULL", eventIds...)
 	if err != nil {
 		return nil, err
 	}
