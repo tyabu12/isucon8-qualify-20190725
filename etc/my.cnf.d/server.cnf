@@ -10,6 +10,7 @@
 
 # this is only for the mysqld standalone daemon
 [mysqld]
+query_cache_size=16M
 
 # this is only for embedded server
 [embedded]
