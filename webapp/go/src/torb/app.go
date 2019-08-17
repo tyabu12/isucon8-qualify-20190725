@@ -130,6 +130,14 @@ func getKvsKeyForEvent(eventID int64) string {
 	return fmt.Sprintf("event:%d", eventID)
 }
 
+func getKvsKeyForAllEventIds() string {
+	return "allEventIds"
+}
+
+func getKvsKeyForPublicEventIds() string {
+	return "publicEventIds"
+}
+
 func newKvsPool(addr string) *redis.Pool {
 	return &redis.Pool{
 		MaxIdle:     5,
@@ -190,17 +198,36 @@ func getUserByLoginName(loginName string) (*User, error) {
 }
 
 func initEventStates(kvs redis.Conn, events []*Event) error {
-	args := redis.Args{}
+	argsForEvent := redis.Args{}
+	argsForEventIds := redis.Args{}.Add(getKvsKeyForAllEventIds())
+	argsForPublic := redis.Args{}.Add(getKvsKeyForPublicEventIds())
 	for _, event := range events {
 		eventJson, err := json.Marshal(event)
 		if err != nil {
 			return err
 		}
-		args = args.Add(getKvsKeyForEvent(event.ID)).Add(eventJson)
+		argsForEvent = argsForEvent.Add(getKvsKeyForEvent(event.ID)).Add(eventJson)
+		argsForEventIds = argsForEventIds.Add(event.ID, event.ID)
+		if event.PublicFg {
+			argsForPublic = argsForPublic.Add(event.ID, event.ID)
+		}
 	}
-	if _, err := kvs.Do("MSET", args...); err != nil {
-		return err
+	if len(argsForEvent) > 1 {
+		if _, err := kvs.Do("MSET", argsForEvent...); err != nil {
+			return err
+		}
 	}
+	if len(argsForEventIds) > 1 {
+		if _, err := kvs.Do("ZADD", argsForEventIds...); err != nil {
+			return err
+		}
+	}
+	if len(argsForPublic) > 1 {
+		if _, err := kvs.Do("ZADD", argsForPublic...); err != nil {
+			return err
+		}
+	}
+
 	for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
 		sheetsByRankShuffle := make([]*Sheet, len(sheetsByRank))
 		for _, event := range events {
@@ -208,7 +235,7 @@ func initEventStates(kvs redis.Conn, events []*Event) error {
 			rand.Shuffle(len(sheetsByRankShuffle), func(i, j int) {
 				sheetsByRankShuffle[i], sheetsByRankShuffle[j] = sheetsByRankShuffle[j], sheetsByRankShuffle[i]
 			})
-			args = redis.Args{}.Add(getKvsKeyForFreeSheets(event.ID, rank))
+			args := redis.Args{}.Add(getKvsKeyForFreeSheets(event.ID, rank))
 			for _, s := range sheetsByRankShuffle {
 				args = args.Add(s.Num)
 			}
@@ -258,6 +285,18 @@ func initSheetsCache() error {
 	}
 
 	return nil
+}
+
+func getEventIDs(publicFg bool) ([]int64, error) {
+	var key string
+	if publicFg {
+		key = getKvsKeyForAllEventIds()
+	} else {
+		key = getKvsKeyForPublicEventIds()
+	}
+	kvs := kvsPool.Get()
+	defer kvs.Close()
+	return redis.Int64s(kvs.Do("ZRANGE", key, 0, -1))
 }
 
 func getBaseEvents(eventIDs []int64) ([]*Event, error) {
@@ -403,31 +442,18 @@ func getLoginAdministrator(c echo.Context) (*Administrator, error) {
 }
 
 func getEvents(all bool) ([]*Event, error) {
-	var sql string
-	if all {
-		sql = "SELECT * FROM events ORDER BY id ASC"
-	} else {
-		sql = "SELECT * FROM events WHERE public_fg = 1 ORDER BY id ASC"
-	}
-	rows, err := db.Query(sql)
+	eventIDs, err := getEventIDs(all)
+	events, err := getBaseEvents(eventIDs)
 	if err != nil {
 		return nil, err
 	}
-	var events []*Event
-	var eventIds []interface{}
+	var eventIDsInterface []interface{}
 	reservations := map[int64]map[int64]*Reservation{}
-	for rows.Next() {
-		var event Event
-		if err := rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		events = append(events, &event)
-		eventIds = append(eventIds, event.ID)
-		reservations[event.ID] = map[int64]*Reservation{}
+	for _, eventID := range eventIDs {
+		eventIDsInterface = append(eventIDsInterface, eventID)
+		reservations[eventID] = map[int64]*Reservation{}
 	}
-	rows.Close()
-	rows, err = db.Query("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (?"+strings.Repeat(",?", len(eventIds)-1)+") and canceled_at IS NULL", eventIds...)
+	rows, err := db.Query("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (?"+strings.Repeat(",?", len(eventIDsInterface)-1)+") and canceled_at IS NULL", eventIDsInterface...)
 	if err != nil {
 		return nil, err
 	}
@@ -1167,30 +1193,44 @@ func main() {
 			return resError(c, "cannot_close_public_event", 400)
 		}
 
-		event.PublicFg = params.Public
-		event.ClosedFg = params.Closed
+		if event.PublicFg != params.Public || event.ClosedFg != params.Closed {
+			oldPublicFg := event.PublicFg
+			event.PublicFg = params.Public
+			event.ClosedFg = params.Closed
 
-		kvs := kvsPool.Get()
-		defer kvs.Close()
-		eventJson, err := json.Marshal(event)
-		if err != nil {
-			return err
-		}
+			kvs := kvsPool.Get()
+			defer kvs.Close()
+			eventJson, err := json.Marshal(event)
+			if err != nil {
+				return err
+			}
 
-		tx, err := db.Begin()
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec("UPDATE events SET public_fg = ?, closed_fg = ? WHERE id = ?", event.PublicFg, event.ClosedFg, event.ID); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if _, err := kvs.Do("SET", getKvsKeyForEvent(event.ID), eventJson); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec("UPDATE events SET public_fg = ?, closed_fg = ? WHERE id = ?", event.PublicFg, event.ClosedFg, event.ID); err != nil {
+				tx.Rollback()
+				return err
+			}
+			if _, err := kvs.Do("SET", getKvsKeyForEvent(event.ID), eventJson); err != nil {
+				tx.Rollback()
+				return err
+			}
+			if !oldPublicFg && event.PublicFg {
+				if _, err := kvs.Do("ZADD", getKvsKeyForPublicEventIds(), event.ID, event.ID); err != nil {
+					tx.Rollback()
+					panic(err)
+				}
+			} else if oldPublicFg && !event.PublicFg {
+				if _, err := kvs.Do("ZREM", getKvsKeyForPublicEventIds(), event.ID); err != nil {
+					tx.Rollback()
+					panic(err)
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
 		}
 
 		c.JSON(200, event)
@@ -1237,7 +1277,20 @@ func main() {
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		rows, err := db.Query("SELECT r.*, e.price AS event_price FROM reservations r INNER JOIN events e ON e.id = r.event_id ORDER BY id ASC")
+		eventIDs, err := getEventIDs(true)
+		if err != nil {
+			return err
+		}
+		events, err := getBaseEvents(eventIDs)
+		if err != nil {
+			return err
+		}
+		eventPrices := map[int64]int64{}
+		for _, event := range events {
+			eventPrices[event.ID] = event.Price
+		}
+
+		rows, err := db.Query("SELECT * FROM reservations ORDER BY id ASC")
 		if err != nil {
 			return err
 		}
@@ -1246,10 +1299,10 @@ func main() {
 		var reports []Report
 		for rows.Next() {
 			var reservation Reservation
-			var eventPrice int64
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &eventPrice); err != nil {
+			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
 				return err
 			}
+			eventPrice := eventPrices[reservation.EventID]
 			sheet := sheetsMapById[reservation.SheetID]
 			report := Report{
 				ReservationID: reservation.ID,
