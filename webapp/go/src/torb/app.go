@@ -114,6 +114,14 @@ func calcPassHash(password string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
 }
 
+func getKvsKeyForUserById(userID int64) string {
+	return fmt.Sprintf("userById:%d", userID)
+}
+
+func getKvsKeyForUserByLoginName(loginName string) string {
+	return fmt.Sprintf("userByLoginName:%s", loginName)
+}
+
 func getKvsKeyForFreeSheets(eventID int64, rank string) string {
 	return fmt.Sprintf("freeSheets:%d:%s", eventID, rank)
 }
@@ -135,6 +143,50 @@ func newKvsPool(addr string) *redis.Pool {
 			return c, err
 		},
 	}
+}
+
+func initUsers(kvs redis.Conn, users []*User) error {
+	args := redis.Args{}
+	for _, user := range users {
+		userJson, err := json.Marshal(user)
+		if err != nil {
+			return err
+		}
+		args = args.Add(getKvsKeyForUserById(user.ID)).Add(userJson)
+		args = args.Add(getKvsKeyForUserByLoginName(user.LoginName)).Add(userJson)
+	}
+	if _, err := kvs.Do("MSET", args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func getUserById(userID int64) (*User, error) {
+	kvs := kvsPool.Get()
+	defer kvs.Close()
+	userJson, err := redis.String(kvs.Do("GET", getKvsKeyForUserById(userID)))
+	if err != nil {
+		return nil, err
+	}
+	var user User
+	if err = json.Unmarshal([]byte(userJson), &user); err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func getUserByLoginName(loginName string) (*User, error) {
+	kvs := kvsPool.Get()
+	defer kvs.Close()
+	userJson, err := redis.String(kvs.Do("GET", getKvsKeyForUserByLoginName(loginName)))
+	if err != nil {
+		return nil, err
+	}
+	var user User
+	if err = json.Unmarshal([]byte(userJson), &user); err != nil {
+		return nil, err
+	}
+	return &user, nil
 }
 
 func initEventStates(kvs redis.Conn, events []*Event) error {
@@ -288,14 +340,20 @@ func adminLoginRequired(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
-func getLoginUser(c echo.Context) (*User, error) {
+func getLoginUserID(c echo.Context) (int64, error) {
 	userID := sessUserID(c)
 	if userID == 0 {
-		return nil, errors.New("not logged in")
+		return -1, errors.New("not logged in")
 	}
-	var user User
-	err := db.QueryRow("SELECT id, nickname FROM users WHERE id = ?", userID).Scan(&user.ID, &user.Nickname)
-	return &user, err
+	return userID, nil
+}
+
+func getLoginUser(c echo.Context) (*User, error) {
+	userID, err := getLoginUserID(c)
+	if err != nil {
+		return nil, err
+	}
+	return getUserById(userID)
 }
 
 func getLoginAdministrator(c echo.Context) (*Administrator, error) {
@@ -539,18 +597,36 @@ func main() {
 			return nil
 		}
 
+		users := []*User{}
+		rows, err := db.Query("SELECT * FROM users")
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var user User
+			if err := rows.Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
+				rows.Close()
+				return err
+			}
+			users = append(users, &user)
+		}
+		rows.Close()
+		if err = initUsers(kvs, users); err != nil {
+			return err
+		}
+
 		if err = initSheetsCache(); err != nil {
 			return err
 		}
 
 		events := []*Event{}
-		rows, err := db.Query("SELECT * FROM events")
+		rows, err = db.Query("SELECT * FROM events")
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
 			var event Event
-			if err := rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
+			if err = rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
 				rows.Close()
 				return err
 			}
@@ -594,8 +670,8 @@ func main() {
 			return err
 		}
 
-		var user User
-		if err := tx.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.LoginName, &user.Nickname, &user.PassHash); err != sql.ErrNoRows {
+		var exists bool
+		if err := tx.QueryRow("SELECT EXISTS (SELECT * FROM users WHERE login_name = ? FOR UPDATE)", params.LoginName).Scan(&exists); err != nil || exists {
 			tx.Rollback()
 			if err == nil {
 				return resError(c, "duplicated", 409)
@@ -603,36 +679,47 @@ func main() {
 			return err
 		}
 
-		res, err := tx.Exec("INSERT INTO users (login_name, pass_hash, nickname) VALUES (?, ?, ?)", params.LoginName, calcPassHash(params.Password), params.Nickname)
+		user := &User{Nickname: params.Nickname, LoginName: params.LoginName, PassHash: calcPassHash(params.Password)}
+
+		res, err := tx.Exec("INSERT INTO users (login_name, pass_hash, nickname) VALUES (?, ?, ?)", user.LoginName, user.PassHash, user.Nickname)
 		if err != nil {
 			tx.Rollback()
 			return resError(c, "", 0)
 		}
-		userID, err := res.LastInsertId()
+		user.ID, err = res.LastInsertId()
 		if err != nil {
 			tx.Rollback()
 			return resError(c, "", 0)
 		}
+
+		kvs := kvsPool.Get()
+		initUsers(kvs, []*User{user})
+		kvs.Close()
+
 		if err := tx.Commit(); err != nil {
 			return err
 		}
 
 		return c.JSON(201, echo.Map{
-			"id":       userID,
-			"nickname": params.Nickname,
+			"id":       user.ID,
+			"nickname": user.Nickname,
 		})
 	})
 	e.GET("/api/users/:id", func(c echo.Context) error {
-		var user User
-		if err := db.QueryRow("SELECT id, nickname FROM users WHERE id = ?", c.Param("id")).Scan(&user.ID, &user.Nickname); err != nil {
-			return err
-		}
-
-		loginUser, err := getLoginUser(c)
+		userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 		if err != nil {
 			return err
 		}
-		if user.ID != loginUser.ID {
+		user, err := getUserById(userID)
+		if err != nil {
+			return err
+		}
+
+		loginUserID, err := getLoginUserID(c)
+		if err != nil {
+			return err
+		}
+		if user.ID != loginUserID {
 			return resError(c, "forbidden", 403)
 		}
 
@@ -718,9 +805,9 @@ func main() {
 		}
 		c.Bind(&params)
 
-		user := new(User)
-		if err := db.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
-			if err == sql.ErrNoRows {
+		user, err := getUserByLoginName(params.LoginName)
+		if err != nil {
+			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "authentication_failed", 401)
 			}
 			return err
@@ -755,9 +842,9 @@ func main() {
 			return resError(c, "not_found", 404)
 		}
 
-		loginUserID := int64(-1)
-		if user, err := getLoginUser(c); err == nil {
-			loginUserID = user.ID
+		loginUserID, err := getLoginUserID(c)
+		if err != nil {
+			loginUserID = int64(-1)
 		}
 
 		event, err := getEvent(eventID, loginUserID)
@@ -781,7 +868,7 @@ func main() {
 		}
 		c.Bind(&params)
 
-		user, err := getLoginUser(c)
+		userID, err := getLoginUserID(c)
 		if err != nil {
 			return err
 		}
@@ -816,7 +903,7 @@ func main() {
 			return err
 		}
 		sheet := sheetsMapByRankAndNum[params.Rank][num]
-		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, user.ID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
+		res, err := tx.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)", event.ID, sheet.ID, userID, time.Now().UTC().Format("2006-01-02 15:04:05.000000"))
 		if err != nil {
 			tx.Rollback()
 			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
@@ -850,7 +937,7 @@ func main() {
 			return err
 		}
 
-		user, err := getLoginUser(c)
+		userID, err := getLoginUserID(c)
 		if err != nil {
 			return err
 		}
@@ -890,7 +977,7 @@ func main() {
 			}
 			return err
 		}
-		if reservation.UserID != user.ID {
+		if reservation.UserID != userID {
 			tx.Rollback()
 			return resError(c, "not_permitted", 403)
 		}
