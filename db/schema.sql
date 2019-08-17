@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE TABLE IF NOT EXISTS sheets (
     id          INTEGER UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-    `rank`      VARCHAR(128)     NOT NULL,
+    `rank`      ENUM('S', 'A', 'B', 'C'),
     num         INTEGER UNSIGNED NOT NULL,
     price       INTEGER UNSIGNED NOT NULL,
     UNIQUE KEY rank_num_uniq (`rank`, num)
