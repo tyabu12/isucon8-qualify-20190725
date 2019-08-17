@@ -27,12 +27,12 @@ CREATE TABLE IF NOT EXISTS reservations (
     event_id    INTEGER UNSIGNED NOT NULL,
     sheet_id    INTEGER UNSIGNED NOT NULL,
     user_id     INTEGER UNSIGNED NOT NULL,
-    reserved_at DATETIME(6)      NOT NULL,
-    canceled_at DATETIME(6)      DEFAULT NULL,
-    updated_at  DATETIME         DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    reserved_at DATETIME         NOT NULL,
+    canceled_at DATETIME         DEFAULT NULL,
+    updated_at  DATETIME         DEFAULT NULL,
     KEY event_id_and_sheet_id_idx (event_id, sheet_id),
     KEY event_id_canceled_at_idx (event_id, canceled_at),
-    KEY user_id_event_id_idx (user_id, event_id)
+    KEY user_id_updated_at_idx (user_id, updated_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS administrators (
