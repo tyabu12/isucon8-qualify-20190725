@@ -5,9 +5,9 @@ WEB_NAME = h2o
 WEB_ACCESS_LOG = /var/log/${WEB_NAME}/access.log
 WEB_ERROR_LOG = /var/log/${WEB_NAME}/error.log
 
-DB_NAME = mariadb
+DB_NAME = mysqld
 DB_USERNAME = isucon
-DB_LOG = /var/log/${DB_NAME}/${DB_NAME}.log
+DB_LOG = /var/log/${DB_NAME}/queries.log
 DB_ERROR_LOG = /var/log/${DB_NAME}/error.log
 DB_SLOW_LOG = /var/log/${DB_NAME}/slow.log
 
@@ -53,7 +53,6 @@ web-error: ## Show web server error log
 
 db-restart: ## Restart DB
 	sudo cp etc/my.cnf /etc/my.cnf
-	sudo cp etc/my.cnf.d/* /etc/my.cnf.d/
 	sudo systemctl restart ${DB_NAME}
 
 db-log: ## Show DB log
