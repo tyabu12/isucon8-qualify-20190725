@@ -319,16 +319,14 @@ func getBaseEvents(eventIDs []int64) ([]*Event, error) {
 	if len(eventIDs) != len(eventJsons) {
 		return nil, redis.ErrNil
 	}
-	events := []*Event{}
-	for _, eventJson := range eventJsons {
+	events := make([]*Event, len(eventJsons))
+	for idx, eventJson := range eventJsons {
 		if eventJson == "" {
 			return nil, redis.ErrNil
 		}
-		var event Event
-		if err = json.Unmarshal([]byte(eventJson), &event); err != nil {
+		if err = json.Unmarshal([]byte(eventJson), &events[idx]); err != nil {
 			return nil, err
 		}
-		events = append(events, &event)
 	}
 	return events, nil
 }
@@ -453,10 +451,10 @@ func getEvents(all bool) ([]*Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	var eventIDsInterface []interface{}
+	eventIDsInterface := make([]interface{}, len(eventIDs))
 	reservations := map[int64]map[int64]*Reservation{}
-	for _, eventID := range eventIDs {
-		eventIDsInterface = append(eventIDsInterface, eventID)
+	for idx, eventID := range eventIDs {
+		eventIDsInterface[idx] = eventID
 		reservations[eventID] = map[int64]*Reservation{}
 	}
 	rows, err := db.Query("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (?"+strings.Repeat(",?", len(eventIDsInterface)-1)+") and canceled_at IS NULL", eventIDsInterface...)
@@ -478,7 +476,9 @@ func getEvents(all bool) ([]*Event, error) {
 		event.Sheets = map[string]*Sheets{}
 		for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
 			event.Sheets[rank] = &Sheets{}
-			for _, sheet := range sheetsByRank {
+			event.Sheets[rank].Total = len(sheetsByRank)
+			event.Sheets[rank].Detail = make([]*Sheet, len(sheetsByRank))
+			for idx, sheet := range sheetsByRank {
 				s := &Sheet{ID: sheet.ID, Rank: rank, Num: sheet.Num, Price: sheet.Price}
 				event.Sheets[rank].Price = event.Price + s.Price
 				reservation, ok := reservations[event.ID][sheet.ID]
@@ -487,13 +487,12 @@ func getEvents(all bool) ([]*Event, error) {
 					s.Reserved = true
 					s.ReservedAtUnix = reservation.ReservedAt.Unix()
 				} else {
-					event.Remains++
 					event.Sheets[rank].Remains++
 				}
-				event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, s)
+				event.Sheets[rank].Detail[idx] = s
 			}
 			event.Total += len(sheetsByRank)
-			event.Sheets[rank].Total = len(sheetsByRank)
+			event.Remains += event.Sheets[rank].Remains
 		}
 	}
 	return events, nil
@@ -526,7 +525,9 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 	event.Sheets = map[string]*Sheets{}
 	for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
 		event.Sheets[rank] = &Sheets{}
-		for _, sheet := range sheetsByRank {
+		event.Sheets[rank].Total = len(sheetsByRank)
+		event.Sheets[rank].Detail = make([]*Sheet, len(sheetsByRank))
+		for idx, sheet := range sheetsByRank {
 			s := &Sheet{ID: sheet.ID, Rank: rank, Num: sheet.Num, Price: sheet.Price}
 			event.Sheets[rank].Price = event.Price + s.Price
 			reservation, ok := reservations[sheet.ID]
@@ -535,13 +536,12 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 				s.Reserved = true
 				s.ReservedAtUnix = reservation.ReservedAt.Unix()
 			} else {
-				event.Remains++
 				event.Sheets[rank].Remains++
 			}
-			event.Sheets[rank].Detail = append(event.Sheets[rank].Detail, s)
+			event.Sheets[rank].Detail[idx] = s
 		}
 		event.Total += len(sheetsByRank)
-		event.Sheets[rank].Total = len(sheetsByRank)
+		event.Remains += event.Sheets[rank].Remains
 	}
 
 	return event, nil
@@ -623,7 +623,6 @@ func main() {
 	}
 	e.Use(session.Middleware(sessions.NewCookieStore([]byte("secret"))))
 	e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{Output: os.Stderr}))
-	e.Static("/", "public")
 	e.GET("/", func(c echo.Context) error {
 		events, err := getEvents(false)
 		if err != nil {
@@ -1414,6 +1413,8 @@ SELECT id, user_id, event_id, updated_at FROM (
 			}
 			reports = append(reports, report)
 		}
+		rows.Close()
+
 		return renderReportCSV(c, reports)
 	}, adminLoginRequired)
 
