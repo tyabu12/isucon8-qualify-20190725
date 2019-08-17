@@ -73,6 +73,7 @@ type Reservation struct {
 	UserID     int64      `json:"-"`
 	ReservedAt *time.Time `json:"-"`
 	CanceledAt *time.Time `json:"-"`
+	UpdatedAt  *time.Time `json:"-"`
 
 	Event          *Event `json:"event,omitempty"`
 	SheetRank      string `json:"sheet_rank,omitempty"`
@@ -136,6 +137,10 @@ func getKvsKeyForAllEventIds() string {
 
 func getKvsKeyForPublicEventIds() string {
 	return "publicEventIds"
+}
+
+func getKvsKeyForRecentReservations(userID int64) string {
+	return fmt.Sprintf("recentReservations:%d")
 }
 
 func newKvsPool(addr string) *redis.Pool {
@@ -780,7 +785,7 @@ func main() {
 		var recentReservations []Reservation
 		for rows.Next() {
 			var reservation Reservation
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
 				return err
 			}
 			sheet := sheetsMapById[reservation.SheetID]
@@ -1017,15 +1022,15 @@ func main() {
 			return err
 		}
 
-		var reservation Reservation
-		if err := tx.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL FOR UPDATE", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+		var reservationID, reservationUserID int64
+		if err := tx.QueryRow("SELECT id, user_id FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL FOR UPDATE", event.ID, sheet.ID).Scan(&reservationID, &reservationUserID); err != nil {
 			tx.Rollback()
 			if err == sql.ErrNoRows {
 				return resError(c, "not_reserved", 400)
 			}
 			return err
 		}
-		if reservation.UserID != userID {
+		if reservationUserID != userID {
 			tx.Rollback()
 			return resError(c, "not_permitted", 403)
 		}
@@ -1035,7 +1040,7 @@ func main() {
 			return err
 		}
 
-		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservation.ID); err != nil {
+		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ? WHERE id = ?", time.Now().UTC().Format("2006-01-02 15:04:05.000000"), reservationID); err != nil {
 			tx.Rollback()
 			kvs.Do("RPOP", getKvsKeyForFreeSheets(event.ID, sheet.Rank))
 			return err
@@ -1256,7 +1261,7 @@ func main() {
 		var reports []Report
 		for rows.Next() {
 			var reservation Reservation
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
 				return err
 			}
 			sheet := sheetsMapById[reservation.SheetID]
@@ -1299,7 +1304,7 @@ func main() {
 		var reports []Report
 		for rows.Next() {
 			var reservation Reservation
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt); err != nil {
+			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
 				return err
 			}
 			eventPrice := eventPrices[reservation.EventID]

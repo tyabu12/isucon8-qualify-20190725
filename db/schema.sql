@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     user_id     INTEGER UNSIGNED NOT NULL,
     reserved_at DATETIME(6)      NOT NULL,
     canceled_at DATETIME(6)      DEFAULT NULL,
+    updated_at  DATETIME         DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     KEY event_id_and_sheet_id_idx (event_id, sheet_id),
     KEY event_id_canceled_at_idx (event_id, canceled_at),
     KEY user_id_event_id_idx (user_id, event_id)
