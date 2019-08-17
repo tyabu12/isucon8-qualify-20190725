@@ -168,7 +168,7 @@ func initUsers(kvs redis.Conn, users []*User) error {
 		args = args.Add(getKvsKeyForUserById(user.ID)).Add(userJson)
 		args = args.Add(getKvsKeyForUserByLoginName(user.LoginName)).Add(userJson)
 	}
-	if _, err := kvs.Do("MSET", args...); err != nil {
+	if err := kvs.Send("MSET", args...); err != nil {
 		return err
 	}
 	return nil
@@ -218,17 +218,17 @@ func initEventStates(kvs redis.Conn, events []*Event) error {
 		}
 	}
 	if len(argsForEvent) > 1 {
-		if _, err := kvs.Do("MSET", argsForEvent...); err != nil {
+		if err := kvs.Send("MSET", argsForEvent...); err != nil {
 			return err
 		}
 	}
 	if len(argsForEventIds) > 1 {
-		if _, err := kvs.Do("ZADD", argsForEventIds...); err != nil {
+		if err := kvs.Send("ZADD", argsForEventIds...); err != nil {
 			return err
 		}
 	}
 	if len(argsForPublic) > 1 {
-		if _, err := kvs.Do("ZADD", argsForPublic...); err != nil {
+		if err := kvs.Send("ZADD", argsForPublic...); err != nil {
 			return err
 		}
 	}
@@ -244,7 +244,7 @@ func initEventStates(kvs redis.Conn, events []*Event) error {
 			for _, s := range sheetsByRankShuffle {
 				args = args.Add(s.Num)
 			}
-			if _, err := kvs.Do("LPUSH", args...); err != nil {
+			if err := kvs.Send("LPUSH", args...); err != nil {
 				return err
 			}
 		}
@@ -700,8 +700,7 @@ func main() {
 				return err
 			}
 			sheet := sheetsMapById[sheetID]
-			_, err = kvs.Do("LREM", getKvsKeyForFreeSheets(eventID, sheet.Rank), 0, sheet.Num)
-			if err != nil {
+			if err = kvs.Send("LREM", getKvsKeyForFreeSheets(eventID, sheet.Rank), 0, sheet.Num); err != nil {
 				rows.Close()
 				return err
 			}
