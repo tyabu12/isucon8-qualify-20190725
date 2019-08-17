@@ -260,6 +260,42 @@ func initSheetsCache() error {
 	return nil
 }
 
+func getBaseEvents(eventIDs []int64) ([]*Event, error) {
+	args := redis.Args{}
+	for _, eventID := range eventIDs {
+		args = args.Add(getKvsKeyForEvent(eventID))
+	}
+	kvs := kvsPool.Get()
+	defer kvs.Close()
+	eventJsons, err := redis.Strings(kvs.Do("MGET", args...))
+	if err != nil {
+		return nil, err
+	}
+	if len(eventIDs) != len(eventJsons) {
+		return nil, redis.ErrNil
+	}
+	events := []*Event{}
+	for _, eventJson := range eventJsons {
+		if eventJson == "" {
+			return nil, redis.ErrNil
+		}
+		var event Event
+		if err = json.Unmarshal([]byte(eventJson), &event); err != nil {
+			return nil, err
+		}
+		events = append(events, &event)
+	}
+	return events, nil
+}
+
+func getBaseEvent(eventID int64) (*Event, error) {
+	events, err := getBaseEvents([]int64{eventID})
+	if err != nil {
+		return nil, err
+	}
+	return events[0], nil
+}
+
 func sessUserID(c echo.Context) int64 {
 	sess, _ := session.Get("session", c)
 	var userID int64
@@ -429,20 +465,6 @@ func getEvents(all bool) ([]*Event, error) {
 		}
 	}
 	return events, nil
-}
-
-func getBaseEvent(eventID int64) (*Event, error) {
-	kvs := kvsPool.Get()
-	defer kvs.Close()
-	eventJson, err := redis.String(kvs.Do("GET", getKvsKeyForEvent(eventID)))
-	if err != nil {
-		return nil, err
-	}
-	var event Event
-	if err = json.Unmarshal([]byte(eventJson), &event); err != nil {
-		return nil, err
-	}
-	return &event, nil
 }
 
 func getEvent(eventID, loginUserID int64) (*Event, error) {
