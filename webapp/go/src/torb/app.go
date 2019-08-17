@@ -719,22 +719,20 @@ func main() {
 		c.Bind(&params)
 
 		user := new(User)
-		if err := db.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.LoginName, &user.Nickname, &user.PassHash); err != nil {
+		if err := db.QueryRow("SELECT * FROM users WHERE login_name = ?", params.LoginName).Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "authentication_failed", 401)
 			}
 			return err
 		}
 
-		if user.PassHash != calcPassHash(params.Password) {
+		passHash := calcPassHash(params.Password)
+		if user.PassHash != passHash {
 			return resError(c, "authentication_failed", 401)
 		}
+		user.PassHash = passHash
 
 		sessSetUserID(c, user.ID)
-		user, err = getLoginUser(c)
-		if err != nil {
-			return err
-		}
 		return c.JSON(200, user)
 	})
 	e.POST("/api/actions/logout", func(c echo.Context) error {
@@ -938,22 +936,20 @@ func main() {
 		c.Bind(&params)
 
 		administrator := new(Administrator)
-		if err := db.QueryRow("SELECT * FROM administrators WHERE login_name = ?", params.LoginName).Scan(&administrator.ID, &administrator.LoginName, &administrator.Nickname, &administrator.PassHash); err != nil {
+		if err := db.QueryRow("SELECT * FROM administrators WHERE login_name = ?", params.LoginName).Scan(&administrator.ID, &administrator.Nickname, &administrator.LoginName, &administrator.PassHash); err != nil {
 			if err == sql.ErrNoRows {
 				return resError(c, "authentication_failed", 401)
 			}
 			return err
 		}
 
-		if administrator.PassHash != calcPassHash(params.Password) {
+		passHash := calcPassHash(params.Password)
+		if administrator.PassHash != passHash {
 			return resError(c, "authentication_failed", 401)
 		}
+		administrator.PassHash = passHash
 
 		sessSetAdministratorID(c, administrator.ID)
-		administrator, err = getLoginAdministrator(c)
-		if err != nil {
-			return err
-		}
 		return c.JSON(200, administrator)
 	})
 	e.POST("/admin/api/actions/logout", func(c echo.Context) error {
