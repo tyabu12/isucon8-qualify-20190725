@@ -26,6 +26,7 @@ import (
 	"github.com/labstack/echo"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/middleware"
+	"golang.org/x/sync/errgroup"
 )
 
 type User struct {
@@ -653,86 +654,104 @@ func main() {
 			return nil
 		}
 
-		users := []*User{}
-		rows, err := db.Query("SELECT * FROM users")
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var user User
-			if err := rows.Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
-				rows.Close()
-				return err
-			}
-			users = append(users, &user)
-		}
-		rows.Close()
-		if err = initUsers(kvs, users); err != nil {
-			return err
-		}
-
 		if err = initSheetsCache(); err != nil {
 			return err
 		}
 
-		events := []*Event{}
-		rows, err = db.Query("SELECT * FROM events")
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var event Event
-			if err = rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
-				rows.Close()
-				return err
-			}
-			events = append(events, &event)
-		}
-		rows.Close()
-		if err = initEventStates(kvs, events); err != nil {
-			return err
-		}
+		var eg errgroup.Group
 
-		rows, err = db.Query("SELECT event_id, sheet_id FROM reservations WHERE canceled_at IS NULL")
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var eventID, sheetID int64
-			if err = rows.Scan(&eventID, &sheetID); err != nil {
-				rows.Close()
+		eg.Go(func() error {
+			users := []*User{}
+			rows, err := db.Query("SELECT * FROM users")
+			if err != nil {
 				return err
 			}
-			sheet := sheetsMapById[sheetID]
-			if err = kvs.Send("LREM", getKvsKeyForFreeSheets(eventID, sheet.Rank), 0, sheet.Num); err != nil {
-				rows.Close()
+			for rows.Next() {
+				var user User
+				if err := rows.Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
+					rows.Close()
+					return err
+				}
+				users = append(users, &user)
+			}
+			rows.Close()
+			if err = initUsers(kvs, users); err != nil {
 				return err
 			}
-		}
-		rows.Close()
+			return nil
+		})
 
-		rows, err = db.Query(`
+		eg.Go(func() error {
+			events := []*Event{}
+			rows, err := db.Query("SELECT * FROM events")
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var event Event
+				if err = rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
+					rows.Close()
+					return err
+				}
+				events = append(events, &event)
+			}
+			rows.Close()
+			if err = initEventStates(kvs, events); err != nil {
+				return err
+			}
+			return nil
+		})
+
+		eg.Go(func() error {
+			rows, err := db.Query("SELECT event_id, sheet_id FROM reservations WHERE canceled_at IS NULL")
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var eventID, sheetID int64
+				if err = rows.Scan(&eventID, &sheetID); err != nil {
+					rows.Close()
+					return err
+				}
+				sheet := sheetsMapById[sheetID]
+				if err = kvs.Send("LREM", getKvsKeyForFreeSheets(eventID, sheet.Rank), 0, sheet.Num); err != nil {
+					rows.Close()
+					return err
+				}
+			}
+			rows.Close()
+			return nil
+		})
+
+		eg.Go(func() error {
+			rows, err := db.Query(`
 SELECT id, user_id, event_id, updated_at FROM (
 	SELECT id, user_id, event_id, updated_at, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC) as bRank FROM (
 		SELECT user_id, event_id, id, updated_at, ROW_NUMBER() OVER (PARTITION BY user_id, event_id ORDER BY updated_at DESC) AS aRank FROM reservations
 	) a WHERE a.aRank = 1 GROUP BY user_id, event_id
 ) b WHERE b.bRank <= 5`)
-		if err != nil {
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var reservationID, userID, eventID int64
+				var updatedAt *time.Time
+				if err = rows.Scan(&reservationID, &userID, &eventID, &updatedAt); err != nil {
+					rows.Close()
+					return err
+				}
+				if err = kvs.Send("ZADD", getKvsKeyForRecentEvents(userID), updatedAt.Unix(), eventID); err != nil {
+					rows.Close()
+					return err
+				}
+			}
+			rows.Close()
+			return nil
+		})
+
+		if err = eg.Wait(); err != nil {
 			return err
 		}
-		for rows.Next() {
-			var reservationID, userID, eventID int64
-			var updatedAt *time.Time
-			if err = rows.Scan(&reservationID, &userID, &eventID, &updatedAt); err != nil {
-				rows.Close()
-				return err
-			}
-			if err = kvs.Send("ZADD", getKvsKeyForRecentEvents(userID), updatedAt.Unix(), eventID); err != nil {
-				rows.Close()
-				return err
-			}
-		}
-		rows.Close()
 
 		if err = kvs.Flush(); err != nil {
 			return err
