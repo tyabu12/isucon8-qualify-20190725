@@ -145,7 +145,7 @@ func getKvsKeyForRecentEvents(userID int64) string {
 
 func newKvsPool(addr string) *redis.Pool {
 	return &redis.Pool{
-		MaxIdle:     5,
+		MaxIdle:     10,
 		IdleTimeout: 240 * time.Second,
 		// Dial or DialContext must be set. When both are set, DialContext takes precedence over Dial.
 		Dial: func() (redis.Conn, error) {
@@ -606,6 +606,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	db.SetMaxIdleConns(10)
 
 	kvsAddr := fmt.Sprintf("%s:%s", os.Getenv("KVS_HOST"), os.Getenv("KVS_PORT"))
 	kvsPool = newKvsPool(kvsAddr)
