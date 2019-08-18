@@ -93,19 +93,8 @@ type Administrator struct {
 var (
 	kvsPool *redis.Pool
 
-	sheetsRanks = []string{"S", "A", "B", "C"}
-	sheetsMap   = map[string]int64{
-		"S": 50,
-		"A": 150,
-		"B": 300,
-		"C": 500,
-	}
-	priceMap = map[string]int64{
-		"S": 5000,
-		"A": 3000,
-		"B": 1000,
-		"C": 0,
-	}
+	totalSheets                int
+	sheetsRanks                = []string{"S", "A", "B", "C"}
 	sheetsMapById              []*Sheet
 	sheetsMapByRankAndNum      map[string]map[int64]*Sheet
 	sheetsMapByRankSortedByNum map[string][]*Sheet
@@ -141,6 +130,14 @@ func getKvsKeyForPublicEventIds() string {
 
 func getKvsKeyForRecentEvents(userID int64) string {
 	return fmt.Sprintf("recentEvents:%d", userID)
+}
+
+func getKvsKeyForReservedCount(eventID int64) string {
+	return fmt.Sprintf("reservedCnt:%d", eventID)
+}
+
+func getKvsKeyForTotalPrice(eventID int64) string {
+	return fmt.Sprintf("totalPrice:%d", eventID)
 }
 
 func newKvsPool(addr string) *redis.Pool {
@@ -273,6 +270,7 @@ func initSheetsCache() error {
 	}
 
 	sheetsMapByRankSortedByNum = map[string][]*Sheet{}
+	totalSheets = 0
 	for rank, sheetsByRank := range sheetsMapByRankAndNum {
 		sheetsMapByRankSortedByNum[rank] = make([]*Sheet, len(sheetsByRank))
 		nums := make([]int64, len(sheetsByRank))
@@ -287,6 +285,7 @@ func initSheetsCache() error {
 		for i, num := range nums {
 			sheetsMapByRankSortedByNum[rank][i] = sheetsByRank[num]
 		}
+		totalSheets += len(sheetsMapByRankSortedByNum[rank])
 	}
 
 	return nil
@@ -456,13 +455,13 @@ func getEvents(all bool) ([]*Event, error) {
 		eventIDsInterface[idx] = eventID
 		reservations[eventID] = map[int64]*Reservation{}
 	}
-	rows, err := db.Query("SELECT event_id, sheet_id, user_id, reserved_at FROM reservations WHERE event_id IN (?"+strings.Repeat(",?", len(eventIDsInterface)-1)+") and canceled_at IS NULL", eventIDsInterface...)
+	rows, err := db.Query("SELECT event_id, sheet_id, reserved_at FROM reservations WHERE event_id IN (?"+strings.Repeat(",?", len(eventIDsInterface)-1)+") and canceled_at IS NULL", eventIDsInterface...)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var reservation Reservation
-		if err := rows.Scan(&reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
+		if err := rows.Scan(&reservation.EventID, &reservation.SheetID, &reservation.ReservedAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -470,7 +469,7 @@ func getEvents(all bool) ([]*Event, error) {
 	}
 	rows.Close()
 	for _, event := range events {
-		event.Total = 0
+		event.Total = totalSheets
 		event.Remains = 0
 		event.Sheets = map[string]*Sheets{}
 		for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
@@ -490,7 +489,6 @@ func getEvents(all bool) ([]*Event, error) {
 				}
 				event.Sheets[rank].Detail[idx] = s
 			}
-			event.Total += len(sheetsByRank)
 			event.Remains += event.Sheets[rank].Remains
 		}
 	}
@@ -519,7 +517,7 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		}
 		rows.Close()
 	}
-	event.Total = 0
+	event.Total = totalSheets
 	event.Remains = 0
 	event.Sheets = map[string]*Sheets{}
 	for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
@@ -539,7 +537,6 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 			}
 			event.Sheets[rank].Detail[idx] = s
 		}
-		event.Total += len(sheetsByRank)
 		event.Remains += event.Sheets[rank].Remains
 	}
 
@@ -772,7 +769,7 @@ SELECT id, user_id, event_id, updated_at FROM (
 		}
 
 		var exists bool
-		if err := tx.QueryRow("SELECT EXISTS (SELECT * FROM users WHERE login_name = ? FOR UPDATE)", params.LoginName).Scan(&exists); err != nil || exists {
+		if err := tx.QueryRow("SELECT EXISTS (SELECT id FROM users WHERE login_name = ? FOR UPDATE)", params.LoginName).Scan(&exists); err != nil || exists {
 			tx.Rollback()
 			if err == nil {
 				return resError(c, "duplicated", 409)
@@ -831,13 +828,12 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return resError(c, "forbidden", 403)
 		}
 
+		var recentReservations []Reservation
 		rows, err := db.Query("SELECT * FROM reservations WHERE user_id = ? ORDER BY updated_at DESC LIMIT 5", user.ID)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
-
-		var recentReservations []Reservation
 		for rows.Next() {
 			var reservation Reservation
 			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
@@ -867,6 +863,7 @@ SELECT id, user_id, event_id, updated_at FROM (
 		if recentReservations == nil {
 			recentReservations = make([]Reservation, 0)
 		}
+		rows.Close()
 
 		var totalPrice int
 		if err := db.QueryRow("SELECT IFNULL(SUM(e.price + s.price), 0) FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.user_id = ? AND r.canceled_at IS NULL", user.ID).Scan(&totalPrice); err != nil {
@@ -890,7 +887,7 @@ SELECT id, user_id, event_id, updated_at FROM (
 				return err
 			}
 			for _, event := range recentEvents {
-				event.Total = 0
+				event.Total = totalSheets
 				event.Remains = 0
 				event.Sheets = map[string]*Sheets{}
 				for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
@@ -902,13 +899,14 @@ SELECT id, user_id, event_id, updated_at FROM (
 					if err != nil {
 						return err
 					}
-					event.Total += len(sheetsByRank)
 					event.Sheets[rank].Total = len(sheetsByRank)
 					event.Sheets[rank].Remains = remains
 					event.Remains += remains
 				}
 			}
 		}
+
+		kvs.Close()
 
 		return c.JSON(200, echo.Map{
 			"id":                  user.ID,
@@ -1198,15 +1196,16 @@ SELECT id, user_id, event_id, updated_at FROM (
 			PublicFg: params.Public,
 			ClosedFg: false,
 			Price:    int64(params.Price),
-			Total:    1000,
-			Remains:  1000,
+			Total:    totalSheets,
+			Remains:  totalSheets,
 			Sheets:   map[string]*Sheets{},
 		}
 		for _, rank := range sheetsRanks {
+			sheets := sheetsMapByRankSortedByNum[rank]
 			event.Sheets[rank] = &Sheets{
-				Total:   int(sheetsMap[rank]),
-				Remains: int(sheetsMap[rank]),
-				Price:   event.Price + priceMap[rank],
+				Total:   len(sheets),
+				Remains: len(sheets),
+				Price:   event.Price + sheets[0].Price,
 			}
 		}
 
