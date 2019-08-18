@@ -16,7 +16,6 @@ import (
 	"os/exec"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
@@ -436,51 +435,33 @@ func getLoginAdministrator(c echo.Context) (*Administrator, error) {
 
 func getEvents(kvs redis.Conn, all bool) ([]*Event, error) {
 	eventIDs, err := getEventIDs(kvs, all)
+	if err != nil {
+		return nil, err
+	}
+	return getEventsByIDs(kvs, eventIDs)
+}
+
+func getEventsByIDs(kvs redis.Conn, eventIDs []int64) ([]*Event, error) {
 	events, err := getBaseEvents(kvs, eventIDs)
 	if err != nil {
 		return nil, err
 	}
-	eventIDsInterface := make([]interface{}, len(eventIDs))
-	reservations := map[int64]map[int64]*Reservation{}
-	for idx, eventID := range eventIDs {
-		eventIDsInterface[idx] = eventID
-		reservations[eventID] = map[int64]*Reservation{}
-	}
-	rows, err := db.Query("SELECT event_id, sheet_id, reserved_at FROM reservations WHERE event_id IN (?"+strings.Repeat(",?", len(eventIDsInterface)-1)+") and canceled_at IS NULL", eventIDsInterface...)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var reservation Reservation
-		if err := rows.Scan(&reservation.EventID, &reservation.SheetID, &reservation.ReservedAt); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		reservations[reservation.EventID][reservation.SheetID] = &reservation
-	}
-	rows.Close()
 	for _, event := range events {
 		event.Total = totalSheets
 		event.Remains = 0
 		event.Sheets = map[string]*Sheets{}
 		for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
-			event.Sheets[rank] = &Sheets{}
-			event.Sheets[rank].Total = len(sheetsByRank)
-			event.Sheets[rank].Detail = make([]*Sheet, len(sheetsByRank))
-			for idx, sheet := range sheetsByRank {
-				s := &Sheet{ID: sheet.ID, Rank: rank, Num: sheet.Num, Price: sheet.Price}
-				event.Sheets[rank].Price = event.Price + s.Price
-				reservation, ok := reservations[event.ID][sheet.ID]
-				if ok {
-					s.Mine = false
-					s.Reserved = true
-					s.ReservedAtUnix = reservation.ReservedAt.Unix()
-				} else {
-					event.Sheets[rank].Remains++
-				}
-				event.Sheets[rank].Detail[idx] = s
+			remains, err := redis.Int(kvs.Do("LLEN", getKvsKeyForFreeSheets(event.ID, rank)))
+			if err != nil {
+				return nil, err
 			}
-			event.Remains += event.Sheets[rank].Remains
+			event.Sheets[rank] = &Sheets{
+				Total:   len(sheetsByRank),
+				Remains: remains,
+				Detail:  nil,
+				Price:   event.Price + sheetsByRank[0].Price,
+			}
+			event.Remains += remains
 		}
 	}
 	return events, nil
@@ -839,10 +820,11 @@ SELECT id, user_id, event_id, updated_at FROM (
 			}
 			sheet := sheetsMapById[reservation.SheetID]
 
-			event, err := getEvent(kvs, reservation.EventID, -1)
+			events, err := getEventsByIDs(kvs, []int64{reservation.EventID})
 			if err != nil {
 				return err
 			}
+			event := events[0]
 			price := event.Sheets[sheet.Rank].Price
 			event.Sheets = nil
 			event.Total = 0
@@ -880,27 +862,9 @@ SELECT id, user_id, event_id, updated_at FROM (
 		if len(recentEventIDs) == 0 {
 			recentEvents = make([]*Event, 0)
 		} else {
-			recentEvents, err = getBaseEvents(kvs, recentEventIDs)
+			recentEvents, err = getEventsByIDs(kvs, recentEventIDs)
 			if err != nil {
 				return err
-			}
-			for _, event := range recentEvents {
-				event.Total = totalSheets
-				event.Remains = 0
-				event.Sheets = map[string]*Sheets{}
-				for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
-					remains, err := redis.Int(kvs.Do("LLEN", getKvsKeyForFreeSheets(event.ID, rank)))
-					if err != nil {
-						return err
-					}
-					event.Sheets[rank] = &Sheets{
-						Total:   len(sheetsByRank),
-						Remains: remains,
-						Detail:  nil,
-						Price:   event.Price + sheetsByRank[0].Price,
-					}
-					event.Remains += remains
-				}
 			}
 		}
 
