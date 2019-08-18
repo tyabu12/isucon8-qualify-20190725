@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
@@ -1336,86 +1335,16 @@ SELECT id, user_id, event_id, updated_at FROM (
 		if err != nil {
 			return resError(c, "not_found", 404)
 		}
-
-		event, err := getBaseEvent(eventID)
-		if err != nil {
-			return err
-		}
-
-		rows, err := db.Query("SELECT * FROM reservations WHERE event_id = ? ORDER BY id ASC", event.ID)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		var reports []Report
-		for rows.Next() {
-			var reservation Reservation
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
-				return err
-			}
-			sheet := sheetsMapById[reservation.SheetID]
-			report := Report{
-				ReservationID: reservation.ID,
-				EventID:       event.ID,
-				Rank:          sheet.Rank,
-				Num:           sheet.Num,
-				UserID:        reservation.UserID,
-				SoldAt:        reservation.ReservedAt.Format("2006-01-02T15:04:05.000000Z"),
-				Price:         event.Price + sheet.Price,
-			}
-			if reservation.CanceledAt != nil {
-				report.CanceledAt = reservation.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
-			}
-			reports = append(reports, report)
-		}
-		return renderReportCSV(c, reports)
+		query := fmt.Sprintf("SELECT * FROM reservations WHERE event_id = %d ORDER BY id ASC", eventID)
+		return renderReportCSV(c, query, []int64{eventID})
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
 		eventIDs, err := getEventIDs(true)
 		if err != nil {
 			return err
 		}
-		events, err := getBaseEvents(eventIDs)
-		if err != nil {
-			return err
-		}
-		eventPrices := map[int64]int64{}
-		for _, event := range events {
-			eventPrices[event.ID] = event.Price
-		}
-
-		rows, err := db.Query("SELECT * FROM reservations ORDER BY id ASC")
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		var reports []Report
-		for rows.Next() {
-			var reservation Reservation
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
-				return err
-			}
-			eventPrice := eventPrices[reservation.EventID]
-			sheet := sheetsMapById[reservation.SheetID]
-			report := Report{
-				ReservationID: reservation.ID,
-				EventID:       reservation.EventID,
-				Rank:          sheet.Rank,
-				Num:           sheet.Num,
-				UserID:        reservation.UserID,
-				SoldAt:        reservation.ReservedAt.Format("2006-01-02T15:04:05.000000Z"),
-				Price:         eventPrice + sheet.Price,
-			}
-			if reservation.CanceledAt != nil {
-				report.CanceledAt = reservation.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
-			}
-			reports = append(reports, report)
-		}
-		rows.Close()
-
-		return renderReportCSV(c, reports)
+		query := "SELECT * FROM reservations ORDER BY id ASC"
+		return renderReportCSV(c, query, eventIDs)
 	}, adminLoginRequired)
 
 	e.Start(":8080")
@@ -1432,17 +1361,64 @@ type Report struct {
 	Price         int64
 }
 
-func renderReportCSV(c echo.Context, reports []Report) error {
-	body := bytes.NewBufferString("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n")
-	for _, v := range reports {
-		body.WriteString(fmt.Sprintf("%d,%d,%s,%d,%d,%d,%s,%s\n",
-			v.ReservationID, v.EventID, v.Rank, v.Num, v.Price, v.UserID, v.SoldAt, v.CanceledAt))
+func renderReportCSV(c echo.Context, query string, eventIDs []int64) error {
+	events, err := getBaseEvents(eventIDs)
+	if err != nil {
+		return err
+	}
+	eventPrices := map[int64]int64{}
+	for _, event := range events {
+		eventPrices[event.ID] = event.Price
+	}
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return err
 	}
 
 	c.Response().Header().Set("Content-Type", `text/csv; charset=UTF-8`)
 	c.Response().Header().Set("Content-Disposition", `attachment; filename="report.csv"`)
-	_, err := io.Copy(c.Response(), body)
-	return err
+	_, err = c.Response().Write([]byte("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n"))
+	if err != nil {
+		return err
+	}
+
+	for rows.Next() {
+		var reservation Reservation
+		if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		eventPrice := eventPrices[reservation.EventID]
+		sheet := sheetsMapById[reservation.SheetID]
+		report := Report{
+			ReservationID: reservation.ID,
+			EventID:       reservation.EventID,
+			Rank:          sheet.Rank,
+			Num:           sheet.Num,
+			UserID:        reservation.UserID,
+			SoldAt:        reservation.ReservedAt.Format("2006-01-02T15:04:05.000000Z"),
+			Price:         eventPrice + sheet.Price,
+		}
+		if reservation.CanceledAt != nil {
+			report.CanceledAt = reservation.CanceledAt.Format("2006-01-02T15:04:05.000000Z")
+		}
+
+		_, err = c.Response().Write([]byte(fmt.Sprintf("%d,%d,%s,%d,%d,%d,%s,%s\n",
+			report.ReservationID,
+			report.EventID,
+			report.Rank,
+			report.Num,
+			report.Price,
+			report.UserID,
+			report.SoldAt,
+			report.CanceledAt)))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func resError(c echo.Context, e string, status int) error {
