@@ -168,9 +168,7 @@ func initUsers(kvs redis.Conn, users []*User) error {
 	return nil
 }
 
-func getUserById(userID int64) (*User, error) {
-	kvs := kvsPool.Get()
-	defer kvs.Close()
+func getUserById(kvs redis.Conn, userID int64) (*User, error) {
 	userJson, err := redis.String(kvs.Do("GET", getKvsKeyForUserById(userID)))
 	if err != nil {
 		return nil, err
@@ -182,9 +180,7 @@ func getUserById(userID int64) (*User, error) {
 	return &user, nil
 }
 
-func getUserByLoginName(loginName string) (*User, error) {
-	kvs := kvsPool.Get()
-	defer kvs.Close()
+func getUserByLoginName(kvs redis.Conn, loginName string) (*User, error) {
 	userJson, err := redis.String(kvs.Do("GET", getKvsKeyForUserByLoginName(loginName)))
 	if err != nil {
 		return nil, err
@@ -288,25 +284,21 @@ func initSheetsCache() error {
 	return nil
 }
 
-func getEventIDs(publicFg bool) ([]int64, error) {
+func getEventIDs(kvs redis.Conn, publicFg bool) ([]int64, error) {
 	var key string
 	if publicFg {
 		key = getKvsKeyForAllEventIds()
 	} else {
 		key = getKvsKeyForPublicEventIds()
 	}
-	kvs := kvsPool.Get()
-	defer kvs.Close()
 	return redis.Int64s(kvs.Do("ZRANGE", key, 0, -1))
 }
 
-func getBaseEvents(eventIDs []int64) ([]*Event, error) {
+func getBaseEvents(kvs redis.Conn, eventIDs []int64) ([]*Event, error) {
 	args := redis.Args{}
 	for _, eventID := range eventIDs {
 		args = args.Add(getKvsKeyForEvent(eventID))
 	}
-	kvs := kvsPool.Get()
-	defer kvs.Close()
 	eventJsons, err := redis.Strings(kvs.Do("MGET", args...))
 	if err != nil {
 		return nil, err
@@ -326,8 +318,8 @@ func getBaseEvents(eventIDs []int64) ([]*Event, error) {
 	return events, nil
 }
 
-func getBaseEvent(eventID int64) (*Event, error) {
-	events, err := getBaseEvents([]int64{eventID})
+func getBaseEvent(kvs redis.Conn, eventID int64) (*Event, error) {
+	events, err := getBaseEvents(kvs, []int64{eventID})
 	if err != nil {
 		return nil, err
 	}
@@ -427,7 +419,9 @@ func getLoginUser(c echo.Context) (*User, error) {
 	if err != nil {
 		return nil, err
 	}
-	return getUserById(userID)
+	kvs := kvsPool.Get()
+	defer kvs.Close()
+	return getUserById(kvs, userID)
 }
 
 func getLoginAdministrator(c echo.Context) (*Administrator, error) {
@@ -440,9 +434,9 @@ func getLoginAdministrator(c echo.Context) (*Administrator, error) {
 	return &administrator, err
 }
 
-func getEvents(all bool) ([]*Event, error) {
-	eventIDs, err := getEventIDs(all)
-	events, err := getBaseEvents(eventIDs)
+func getEvents(kvs redis.Conn, all bool) ([]*Event, error) {
+	eventIDs, err := getEventIDs(kvs, all)
+	events, err := getBaseEvents(kvs, eventIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -492,8 +486,8 @@ func getEvents(all bool) ([]*Event, error) {
 	return events, nil
 }
 
-func getEvent(eventID, loginUserID int64) (*Event, error) {
-	event, err := getBaseEvent(eventID)
+func getEvent(kvs redis.Conn, eventID, loginUserID int64) (*Event, error) {
+	event, err := getBaseEvent(kvs, eventID)
 	if err != nil {
 		return nil, err
 	}
@@ -619,7 +613,9 @@ func main() {
 	e.Use(session.Middleware(sessions.NewCookieStore([]byte("secret"))))
 	e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{Output: os.Stderr}))
 	e.GET("/", func(c echo.Context) error {
-		events, err := getEvents(false)
+		kvs := kvsPool.Get()
+		events, err := getEvents(kvs, false)
+		kvs.Close()
 		if err != nil {
 			return err
 		}
@@ -813,7 +809,11 @@ SELECT id, user_id, event_id, updated_at FROM (
 		if err != nil {
 			return err
 		}
-		user, err := getUserById(userID)
+
+		kvs := kvsPool.Get()
+		defer kvs.Close()
+
+		user, err := getUserById(kvs, userID)
 		if err != nil {
 			return err
 		}
@@ -839,7 +839,7 @@ SELECT id, user_id, event_id, updated_at FROM (
 			}
 			sheet := sheetsMapById[reservation.SheetID]
 
-			event, err := getEvent(reservation.EventID, -1)
+			event, err := getEvent(kvs, reservation.EventID, -1)
 			if err != nil {
 				return err
 			}
@@ -863,9 +863,6 @@ SELECT id, user_id, event_id, updated_at FROM (
 		}
 		rows.Close()
 
-		kvs := kvsPool.Get()
-		defer kvs.Close()
-
 		totalPrice, err := redis.Int(kvs.Do("GET", getKvsKeyForTotalPrice(user.ID)))
 		if err != nil {
 			if err != redis.ErrNil {
@@ -883,7 +880,7 @@ SELECT id, user_id, event_id, updated_at FROM (
 		if len(recentEventIDs) == 0 {
 			recentEvents = make([]*Event, 0)
 		} else {
-			recentEvents, err = getBaseEvents(recentEventIDs)
+			recentEvents, err = getBaseEvents(kvs, recentEventIDs)
 			if err != nil {
 				return err
 			}
@@ -924,7 +921,9 @@ SELECT id, user_id, event_id, updated_at FROM (
 		}
 		c.Bind(&params)
 
-		user, err := getUserByLoginName(params.LoginName)
+		kvs := kvsPool.Get()
+		user, err := getUserByLoginName(kvs, params.LoginName)
+		kvs.Close()
 		if err != nil {
 			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "authentication_failed", 401)
@@ -946,7 +945,9 @@ SELECT id, user_id, event_id, updated_at FROM (
 		return c.NoContent(204)
 	}, loginRequired)
 	e.GET("/api/events", func(c echo.Context) error {
-		events, err := getEvents(true)
+		kvs := kvsPool.Get()
+		events, err := getEvents(kvs, true)
+		kvs.Close()
 		if err != nil {
 			return err
 		}
@@ -966,7 +967,9 @@ SELECT id, user_id, event_id, updated_at FROM (
 			loginUserID = int64(-1)
 		}
 
-		event, err := getEvent(eventID, loginUserID)
+		kvs := kvsPool.Get()
+		event, err := getEvent(kvs, eventID, loginUserID)
+		kvs.Close()
 		if err != nil {
 			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "not_found", 404)
@@ -992,7 +995,10 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return err
 		}
 
-		event, err := getBaseEvent(eventID)
+		kvs := kvsPool.Get()
+		defer kvs.Close()
+
+		event, err := getBaseEvent(kvs, eventID)
 		if err != nil {
 			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "invalid_event", 404)
@@ -1005,9 +1011,6 @@ SELECT id, user_id, event_id, updated_at FROM (
 		if !validateRank(params.Rank) {
 			return resError(c, "invalid_rank", 400)
 		}
-
-		kvs := kvsPool.Get()
-		defer kvs.Close()
 
 		now := time.Now().UTC()
 		nowString := now.Format("2006-01-02 15:04:05")
@@ -1050,6 +1053,7 @@ SELECT id, user_id, event_id, updated_at FROM (
 		}
 
 		kvs.Do("EXEC")
+		kvs.Close()
 
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
@@ -1073,7 +1077,10 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return err
 		}
 
-		event, err := getBaseEvent(eventID)
+		kvs := kvsPool.Get()
+		defer kvs.Close()
+
+		event, err := getBaseEvent(kvs, eventID)
 		if err != nil {
 			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "invalid_event", 404)
@@ -1091,9 +1098,6 @@ SELECT id, user_id, event_id, updated_at FROM (
 		if !ok {
 			return resError(c, "invalid_sheet", 404)
 		}
-
-		kvs := kvsPool.Get()
-		defer kvs.Close()
 
 		now := time.Now().UTC()
 		nowString := now.Format("2006-01-02 15:04:05")
@@ -1157,8 +1161,10 @@ SELECT id, user_id, event_id, updated_at FROM (
 		var events []*Event
 		administrator := c.Get("administrator")
 		if administrator != nil {
+			kvs := kvsPool.Get()
+			defer kvs.Close()
 			var err error
-			if events, err = getEvents(true); err != nil {
+			if events, err = getEvents(kvs, true); err != nil {
 				return err
 			}
 		}
@@ -1197,7 +1203,9 @@ SELECT id, user_id, event_id, updated_at FROM (
 		return c.NoContent(204)
 	}, adminLoginRequired)
 	e.GET("/admin/api/events", func(c echo.Context) error {
-		events, err := getEvents(true)
+		kvs := kvsPool.Get()
+		events, err := getEvents(kvs, true)
+		kvs.Close()
 		if err != nil {
 			return err
 		}
@@ -1268,7 +1276,9 @@ SELECT id, user_id, event_id, updated_at FROM (
 		if err != nil {
 			return resError(c, "not_found", 404)
 		}
-		event, err := getEvent(eventID, -1)
+		kvs := kvsPool.Get()
+		event, err := getEvent(kvs, eventID, -1)
+		kvs.Close()
 		if err != nil {
 			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "not_found", 404)
@@ -1292,7 +1302,10 @@ SELECT id, user_id, event_id, updated_at FROM (
 			params.Public = false
 		}
 
-		event, err := getBaseEvent(eventID)
+		kvs := kvsPool.Get()
+		defer kvs.Close()
+
+		event, err := getBaseEvent(kvs, eventID)
 		if err != nil {
 			if err == sql.ErrNoRows || err == redis.ErrNil {
 				return resError(c, "not_found", 404)
@@ -1311,8 +1324,6 @@ SELECT id, user_id, event_id, updated_at FROM (
 			event.PublicFg = params.Public
 			event.ClosedFg = params.Closed
 
-			kvs := kvsPool.Get()
-			defer kvs.Close()
 			eventJson, err := json.Marshal(event)
 			if err != nil {
 				return err
@@ -1346,6 +1357,8 @@ SELECT id, user_id, event_id, updated_at FROM (
 			}
 		}
 
+		kvs.Close()
+
 		c.JSON(200, event)
 		return nil
 	}, adminLoginRequired)
@@ -1354,16 +1367,20 @@ SELECT id, user_id, event_id, updated_at FROM (
 		if err != nil {
 			return resError(c, "not_found", 404)
 		}
+		kvs := kvsPool.Get()
+		defer kvs.Close()
 		query := fmt.Sprintf("SELECT * FROM reservations WHERE event_id = %d ORDER BY id ASC", eventID)
-		return renderReportCSV(c, query, []int64{eventID})
+		return renderReportCSV(c, kvs, query, []int64{eventID})
 	}, adminLoginRequired)
 	e.GET("/admin/api/reports/sales", func(c echo.Context) error {
-		eventIDs, err := getEventIDs(true)
+		kvs := kvsPool.Get()
+		defer kvs.Close()
+		eventIDs, err := getEventIDs(kvs, true)
 		if err != nil {
 			return err
 		}
 		query := "SELECT * FROM reservations ORDER BY id ASC"
-		return renderReportCSV(c, query, eventIDs)
+		return renderReportCSV(c, kvs, query, eventIDs)
 	}, adminLoginRequired)
 
 	e.Start(":8080")
@@ -1380,8 +1397,8 @@ type Report struct {
 	Price         int64
 }
 
-func renderReportCSV(c echo.Context, query string, eventIDs []int64) error {
-	events, err := getBaseEvents(eventIDs)
+func renderReportCSV(c echo.Context, kvs redis.Conn, query string, eventIDs []int64) error {
+	events, err := getBaseEvents(kvs, eventIDs)
 	if err != nil {
 		return err
 	}
