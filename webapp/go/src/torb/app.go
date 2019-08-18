@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
@@ -129,6 +130,10 @@ func getKvsKeyForPublicEventIds() string {
 
 func getKvsKeyForRecentEvents(userID int64) string {
 	return fmt.Sprintf("recentEvents:%d", userID)
+}
+
+func getKvsKeyForRecentReservationIDs(userID int64) string {
+	return fmt.Sprintf("recentReservationIDs:%d", userID)
 }
 
 func getKvsKeyForTotalPrice(eventID int64) string {
@@ -462,6 +467,7 @@ func getEventsByIDs(kvs redis.Conn, eventIDs []int64) ([]*Event, error) {
 			}
 		}
 	}
+	kvs.Flush()
 	for _, event := range events {
 		for _, rank := range sheetsRanks {
 			remains, err := redis.Int(kvs.Receive())
@@ -704,27 +710,47 @@ func main() {
 
 		eg.Go(func() error {
 			rows, err := db.Query(`
-SELECT id, user_id, event_id, updated_at FROM (
-	SELECT id, user_id, event_id, updated_at, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC) as bRank FROM (
-		SELECT user_id, event_id, id, updated_at, ROW_NUMBER() OVER (PARTITION BY user_id, event_id ORDER BY updated_at DESC) AS aRank FROM reservations
-	) a WHERE a.aRank = 1 GROUP BY user_id, event_id
-) b WHERE b.bRank <= 5`)
+SELECT id, user_id, updated_at FROM (
+	SELECT id, user_id, updated_at, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC) as row_num FROM reservations
+) a WHERE row_num <= 5`)
 			if err != nil {
 				return err
 			}
+			defer rows.Close()
+			for rows.Next() {
+				var reservationID, userID int64
+				var updatedAt *time.Time
+				if err = rows.Scan(&reservationID, &userID, &updatedAt); err != nil {
+					return err
+				}
+				if err = kvs.Send("ZADD", getKvsKeyForRecentReservationIDs(userID), updatedAt.UnixNano(), reservationID); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+
+		eg.Go(func() error {
+			rows, err := db.Query(`
+SELECT id, user_id, event_id, updated_at FROM (
+	SELECT id, user_id, event_id, updated_at, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC) as row_num FROM (
+		SELECT user_id, event_id, id, updated_at, ROW_NUMBER() OVER (PARTITION BY user_id, event_id ORDER BY updated_at DESC) AS row_num FROM reservations
+	) a WHERE a.row_num = 1 GROUP BY user_id, event_id
+) b WHERE b.row_num <= 5`)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
 			for rows.Next() {
 				var reservationID, userID, eventID int64
 				var updatedAt *time.Time
 				if err = rows.Scan(&reservationID, &userID, &eventID, &updatedAt); err != nil {
-					rows.Close()
 					return err
 				}
-				if err = kvs.Send("ZADD", getKvsKeyForRecentEvents(userID), updatedAt.Unix(), eventID); err != nil {
-					rows.Close()
+				if err = kvs.Send("ZADD", getKvsKeyForRecentEvents(userID), updatedAt.UnixNano(), eventID); err != nil {
 					return err
 				}
 			}
-			rows.Close()
 			return nil
 		})
 
@@ -815,43 +841,55 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return resError(c, "forbidden", 403)
 		}
 
-		var recentReservations []Reservation
-		rows, err := db.Query("SELECT * FROM reservations WHERE user_id = ? ORDER BY updated_at DESC LIMIT 5", user.ID)
-		if err != nil {
+		recentReservationIDs, err := redis.Int64s(kvs.Do("ZREVRANGE", getKvsKeyForRecentReservationIDs(user.ID), 0, 4))
+		if err != nil && err != redis.ErrNil {
 			return err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var reservation Reservation
-			if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
-				return err
+		var recentReservations []Reservation
+		if err == redis.ErrNil || len(recentReservationIDs) == 0 {
+			recentReservations = make([]Reservation, 0)
+		} else {
+			recentReservations = make([]Reservation, len(recentReservationIDs))
+			recentReservationIDsMap := map[int64]int{}
+			recentReservationIDsInterface := make([]interface{}, len(recentReservationIDs))
+			for idx, recentReservationID := range recentReservationIDs {
+				recentReservationIDsInterface[idx] = recentReservationID
+				recentReservationIDsMap[recentReservationID] = idx
 			}
-			sheet := sheetsMapById[reservation.SheetID]
-
-			events, err := getEventsByIDs(kvs, []int64{reservation.EventID})
+			rows, err := db.Query("SELECT * FROM reservations WHERE id IN (?"+strings.Repeat(",?", len(recentReservationIDs)-1)+")", recentReservationIDsInterface...)
 			if err != nil {
 				return err
 			}
-			event := events[0]
-			price := event.Sheets[sheet.Rank].Price
-			event.Sheets = nil
-			event.Total = 0
-			event.Remains = 0
+			defer rows.Close()
+			for rows.Next() {
+				var reservation Reservation
+				if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
+					return err
+				}
+				sheet := sheetsMapById[reservation.SheetID]
 
-			reservation.Event = event
-			reservation.SheetRank = sheet.Rank
-			reservation.SheetNum = sheet.Num
-			reservation.Price = price
-			reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
-			if reservation.CanceledAt != nil {
-				reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
+				events, err := getEventsByIDs(kvs, []int64{reservation.EventID})
+				if err != nil {
+					return err
+				}
+				event := events[0]
+				price := event.Sheets[sheet.Rank].Price
+				event.Sheets = nil
+				event.Total = 0
+				event.Remains = 0
+
+				reservation.Event = event
+				reservation.SheetRank = sheet.Rank
+				reservation.SheetNum = sheet.Num
+				reservation.Price = price
+				reservation.ReservedAtUnix = reservation.ReservedAt.Unix()
+				if reservation.CanceledAt != nil {
+					reservation.CanceledAtUnix = reservation.CanceledAt.Unix()
+				}
+
+				recentReservations[recentReservationIDsMap[reservation.ID]] = reservation
 			}
-			recentReservations = append(recentReservations, reservation)
 		}
-		if recentReservations == nil {
-			recentReservations = make([]Reservation, 0)
-		}
-		rows.Close()
 
 		totalPrice, err := redis.Int(kvs.Do("GET", getKvsKeyForTotalPrice(user.ID)))
 		if err != nil {
@@ -1024,6 +1062,12 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return err
 		}
 
+		if err := kvs.Send("ZADD", getKvsKeyForRecentReservationIDs(userID), now.UnixNano(), reservationID); err != nil {
+			kvs.Do("DISCARD")
+			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
+			return err
+		}
+
 		kvs.Do("EXEC")
 		kvs.Close()
 
@@ -1095,6 +1139,12 @@ SELECT id, user_id, event_id, updated_at FROM (
 		kvs.Send("MULTI")
 
 		if err := kvs.Send("RPUSH", getKvsKeyForFreeSheets(event.ID, sheet.Rank), sheet.Num); err != nil {
+			tx.Rollback()
+			kvs.Do("DISCARD")
+			return err
+		}
+
+		if err := kvs.Send("ZADD", getKvsKeyForRecentReservationIDs(userID), now.UnixNano(), reservationID); err != nil {
 			tx.Rollback()
 			kvs.Do("DISCARD")
 			return err
