@@ -132,10 +132,6 @@ func getKvsKeyForRecentEvents(userID int64) string {
 	return fmt.Sprintf("recentEvents:%d", userID)
 }
 
-func getKvsKeyForReservedCount(eventID int64) string {
-	return fmt.Sprintf("reservedCnt:%d", eventID)
-}
-
 func getKvsKeyForTotalPrice(eventID int64) string {
 	return fmt.Sprintf("totalPrice:%d", eventID)
 }
@@ -896,16 +892,16 @@ SELECT id, user_id, event_id, updated_at FROM (
 				event.Remains = 0
 				event.Sheets = map[string]*Sheets{}
 				for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
-					event.Sheets[rank] = &Sheets{}
-					for _, sheet := range sheetsByRank {
-						event.Sheets[rank].Price = event.Price + sheet.Price
-					}
 					remains, err := redis.Int(kvs.Do("LLEN", getKvsKeyForFreeSheets(event.ID, rank)))
 					if err != nil {
 						return err
 					}
-					event.Sheets[rank].Total = len(sheetsByRank)
-					event.Sheets[rank].Remains = remains
+					event.Sheets[rank] = &Sheets{
+						Total:   len(sheetsByRank),
+						Remains: remains,
+						Detail:  nil,
+						Price:   event.Price + sheetsByRank[0].Price,
+					}
 					event.Remains += remains
 				}
 			}
