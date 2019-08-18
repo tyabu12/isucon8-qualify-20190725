@@ -450,17 +450,25 @@ func getEventsByIDs(kvs redis.Conn, eventIDs []int64) ([]*Event, error) {
 		event.Total = totalSheets
 		event.Remains = 0
 		event.Sheets = map[string]*Sheets{}
-		for rank, sheetsByRank := range sheetsMapByRankSortedByNum {
-			remains, err := redis.Int(kvs.Do("LLEN", getKvsKeyForFreeSheets(event.ID, rank)))
-			if err != nil {
+		for _, rank := range sheetsRanks {
+			sheetsByRank := sheetsMapByRankSortedByNum[rank]
+			if err := kvs.Send("LLEN", getKvsKeyForFreeSheets(event.ID, rank)); err != nil {
 				return nil, err
 			}
 			event.Sheets[rank] = &Sheets{
-				Total:   len(sheetsByRank),
-				Remains: remains,
-				Detail:  nil,
-				Price:   event.Price + sheetsByRank[0].Price,
+				Total:  len(sheetsByRank),
+				Detail: nil,
+				Price:  event.Price + sheetsByRank[0].Price,
 			}
+		}
+	}
+	for _, event := range events {
+		for _, rank := range sheetsRanks {
+			remains, err := redis.Int(kvs.Receive())
+			if err != nil {
+				return nil, err
+			}
+			event.Sheets[rank].Remains = remains
 			event.Remains += remains
 		}
 	}
