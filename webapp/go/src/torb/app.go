@@ -162,8 +162,9 @@ func initUsers(kvs redis.Conn, users []*User) error {
 		if err != nil {
 			return err
 		}
-		args = args.Add(getKvsKeyForUserById(user.ID)).Add(userJson)
-		args = args.Add(getKvsKeyForUserByLoginName(user.LoginName)).Add(userJson)
+		args = args.Add(getKvsKeyForUserById(user.ID), userJson)
+		args = args.Add(getKvsKeyForUserByLoginName(user.LoginName), userJson)
+		args = args.Add(getKvsKeyForTotalPrice(user.ID), 0)
 	}
 	if err := kvs.Send("MSET", args...); err != nil {
 		return err
@@ -607,6 +608,7 @@ func main() {
 
 	kvsAddr := fmt.Sprintf("%s:%s", os.Getenv("KVS_HOST"), os.Getenv("KVS_PORT"))
 	kvsPool = newKvsPool(kvsAddr)
+	defer kvsPool.Close()
 
 	e := echo.New()
 	funcs := template.FuncMap{
@@ -865,13 +867,16 @@ SELECT id, user_id, event_id, updated_at FROM (
 		}
 		rows.Close()
 
-		var totalPrice int
-		if err := db.QueryRow("SELECT IFNULL(SUM(e.price + s.price), 0) FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.user_id = ? AND r.canceled_at IS NULL", user.ID).Scan(&totalPrice); err != nil {
-			return err
-		}
-
 		kvs := kvsPool.Get()
 		defer kvs.Close()
+
+		totalPrice, err := redis.Int(kvs.Do("GET", getKvsKeyForTotalPrice(user.ID)))
+		if err != nil {
+			if err != redis.ErrNil {
+				return err
+			}
+			totalPrice = 0
+		}
 
 		recentEventIDs, err := redis.Int64s(kvs.Do("ZREVRANGE", getKvsKeyForRecentEvents(user.ID), 0, 4))
 		if err != nil && err != redis.ErrNil {
@@ -1019,24 +1024,36 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return err
 		}
 
+		sheet := sheetsMapByRankAndNum[params.Rank][num]
+
+		kvs.Send("MULTI")
+
 		if err := kvs.Send("ZADD", getKvsKeyForRecentEvents(userID), now.UnixNano(), event.ID); err != nil {
+			kvs.Do("DISCARD")
 			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
 			return err
 		}
-		sheet := sheetsMapByRankAndNum[params.Rank][num]
+
+		if err := kvs.Send("INCRBY", getKvsKeyForTotalPrice(userID), sheet.Price); err != nil {
+			kvs.Do("DISCARD")
+			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
+			return err
+		}
 
 		res, err := db.Exec("INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at, updated_at) VALUES (?, ?, ?, ?, ?)", event.ID, sheet.ID, userID, nowString, nowString)
 		if err != nil {
+			kvs.Do("DISCARD")
 			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
 			return err
 		}
 		reservationID, err := res.LastInsertId()
 		if err != nil {
+			kvs.Do("DISCARD")
 			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
 			return err
 		}
 
-		kvs.Flush()
+		kvs.Do("EXEC")
 
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
@@ -1112,6 +1129,12 @@ SELECT id, user_id, event_id, updated_at FROM (
 		}
 
 		if err := kvs.Send("ZADD", getKvsKeyForRecentEvents(reservationUserID), now.UnixNano(), event.ID); err != nil {
+			tx.Rollback()
+			kvs.Do("DISCARD")
+			return err
+		}
+
+		if err := kvs.Send("DECRBY", getKvsKeyForTotalPrice(userID), sheet.Price); err != nil {
 			tx.Rollback()
 			kvs.Do("DISCARD")
 			return err
