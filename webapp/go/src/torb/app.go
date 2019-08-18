@@ -83,6 +83,16 @@ type Reservation struct {
 	CanceledAtUnix int64  `json:"canceled_at,omitempty"`
 }
 
+type ActiveReservation struct {
+	ID         int64      `json:"id"`
+	EventID    int64      `json:"event_id"`
+	SheetID    int64      `json:"sheet_id"`
+	UserID     int64      `json:"user_id"`
+	ReservedAt *time.Time `json:"reserved_at"`
+	CanceledAt *time.Time `json:"canceled_at,omitempty"`
+	UpdatedAt  *time.Time `json:"updated_at"`
+}
+
 type Administrator struct {
 	ID        int64  `json:"id,omitempty"`
 	Nickname  string `json:"nickname,omitempty"`
@@ -120,6 +130,10 @@ func getKvsKeyForEvent(eventID int64) string {
 	return fmt.Sprintf("event:%d", eventID)
 }
 
+func getKvsKeyForActiveReservations(eventID int64) string {
+	return fmt.Sprintf("reservation:%d", eventID)
+}
+
 func getKvsKeyForAllEventIds() string {
 	return "allEventIds"
 }
@@ -143,7 +157,7 @@ func getKvsKeyForTotalPrice(eventID int64) string {
 func newKvsPool(addr string) *redis.Pool {
 	return &redis.Pool{
 		MaxIdle:     10,
-		IdleTimeout: 240 * time.Second,
+		IdleTimeout: 90 * time.Second,
 		// Dial or DialContext must be set. When both are set, DialContext takes precedence over Dial.
 		Dial: func() (redis.Conn, error) {
 			c, err := redis.Dial("tcp", addr)
@@ -288,9 +302,9 @@ func initSheetsCache() error {
 	return nil
 }
 
-func getEventIDs(kvs redis.Conn, publicFg bool) ([]int64, error) {
+func getEventIDs(kvs redis.Conn, all bool) ([]int64, error) {
 	var key string
-	if publicFg {
+	if all {
 		key = getKvsKeyForAllEventIds()
 	} else {
 		key = getKvsKeyForPublicEventIds()
@@ -315,9 +329,11 @@ func getBaseEvents(kvs redis.Conn, eventIDs []int64) ([]*Event, error) {
 		if eventJson == "" {
 			return nil, redis.ErrNil
 		}
-		if err = json.Unmarshal([]byte(eventJson), &events[idx]); err != nil {
+		var event Event
+		if err = json.Unmarshal([]byte(eventJson), &event); err != nil {
 			return nil, err
 		}
+		events[idx] = &event
 	}
 	return events, nil
 }
@@ -486,22 +502,16 @@ func getEvent(kvs redis.Conn, eventID, loginUserID int64) (*Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	reservations := map[int64]*Reservation{}
-	rows, err := db.Query("SELECT sheet_id, user_id, reserved_at FROM reservations WHERE event_id = ? AND canceled_at IS NULL", event.ID)
-	if err != nil {
-		if err != sql.ErrNoRows {
-			return nil, err
-		}
-	} else {
-		for rows.Next() {
-			var reservation Reservation
-			if err := rows.Scan(&reservation.SheetID, &reservation.UserID, &reservation.ReservedAt); err != nil {
-				rows.Close()
+	reservations := map[int64]*ActiveReservation{}
+	reservationJsons, err := redis.StringMap(kvs.Do("HGETALL", getKvsKeyForActiveReservations(eventID)))
+	if err == nil && len(reservationJsons) > 0 {
+		for _, reservationJson := range reservationJsons {
+			var reservation ActiveReservation
+			if err = json.Unmarshal([]byte(reservationJson), &reservation); err != nil {
 				return nil, err
 			}
 			reservations[reservation.SheetID] = &reservation
 		}
-		rows.Close()
 	}
 	event.Total = totalSheets
 	event.Remains = 0
@@ -651,15 +661,14 @@ func main() {
 			if err != nil {
 				return err
 			}
+			defer rows.Close()
 			for rows.Next() {
 				var user User
 				if err := rows.Scan(&user.ID, &user.Nickname, &user.LoginName, &user.PassHash); err != nil {
-					rows.Close()
 					return err
 				}
 				users = append(users, &user)
 			}
-			rows.Close()
 			if err = initUsers(kvs, users); err != nil {
 				return err
 			}
@@ -672,15 +681,14 @@ func main() {
 			if err != nil {
 				return err
 			}
+			defer rows.Close()
 			for rows.Next() {
 				var event Event
 				if err = rows.Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
-					rows.Close()
 					return err
 				}
 				events = append(events, &event)
 			}
-			rows.Close()
 			if err = initEventStates(kvs, events); err != nil {
 				return err
 			}
@@ -688,23 +696,29 @@ func main() {
 		})
 
 		eg.Go(func() error {
-			rows, err := db.Query("SELECT event_id, sheet_id FROM reservations WHERE canceled_at IS NULL")
+			rows, err := db.Query("SELECT * FROM reservations WHERE canceled_at IS NULL")
 			if err != nil {
 				return err
 			}
+			defer rows.Close()
 			for rows.Next() {
-				var eventID, sheetID int64
-				if err = rows.Scan(&eventID, &sheetID); err != nil {
+				var reservation ActiveReservation
+				if err = rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
 					rows.Close()
 					return err
 				}
-				sheet := sheetsMapById[sheetID]
-				if err = kvs.Send("LREM", getKvsKeyForFreeSheets(eventID, sheet.Rank), 0, sheet.Num); err != nil {
-					rows.Close()
+				sheet := sheetsMapById[reservation.SheetID]
+				reservationJson, err := json.Marshal(&reservation)
+				if err != nil {
+					return err
+				}
+				if err = kvs.Send("HSET", getKvsKeyForActiveReservations(reservation.EventID), sheet.ID, reservationJson); err != nil {
+					return err
+				}
+				if err = kvs.Send("LREM", getKvsKeyForFreeSheets(reservation.EventID, sheet.Rank), 0, sheet.Num); err != nil {
 					return err
 				}
 			}
-			rows.Close()
 			return nil
 		})
 
@@ -1022,9 +1036,6 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return resError(c, "invalid_rank", 400)
 		}
 
-		now := time.Now().UTC()
-		nowString := now.Format("2006-01-02 15:04:05")
-
 		num, err := redis.Int64(kvs.Do("LPOP", getKvsKeyForFreeSheets(event.ID, params.Rank)))
 		if err != nil {
 			if err == redis.ErrNil {
@@ -1034,6 +1045,8 @@ SELECT id, user_id, event_id, updated_at FROM (
 		}
 
 		sheet := sheetsMapByRankAndNum[params.Rank][num]
+		now := time.Now().UTC()
+		nowString := now.Format("2006-01-02 15:04:05")
 
 		kvs.Send("MULTI")
 
@@ -1062,6 +1075,27 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return err
 		}
 
+		reservation := ActiveReservation{
+			ID:         reservationID,
+			EventID:    eventID,
+			SheetID:    sheet.ID,
+			UserID:     userID,
+			ReservedAt: &now,
+			CanceledAt: nil,
+			UpdatedAt:  &now,
+		}
+		reservationJson, err := json.Marshal(&reservation)
+		if err != nil {
+			kvs.Do("DISCARD")
+			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
+			return err
+		}
+		if err := kvs.Send("HSET", getKvsKeyForActiveReservations(eventID), sheet.ID, reservationJson); err != nil {
+			kvs.Do("DISCARD")
+			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
+			return err
+		}
+
 		if err := kvs.Send("ZADD", getKvsKeyForRecentReservationIDs(userID), now.UnixNano(), reservationID); err != nil {
 			kvs.Do("DISCARD")
 			kvs.Do("RPUSH", getKvsKeyForFreeSheets(event.ID, params.Rank), num)
@@ -1073,7 +1107,7 @@ SELECT id, user_id, event_id, updated_at FROM (
 
 		return c.JSON(202, echo.Map{
 			"id":         reservationID,
-			"sheet_rank": params.Rank,
+			"sheet_rank": sheet.Rank,
 			"sheet_num":  sheet.Num,
 		})
 	}, loginRequired)
@@ -1115,25 +1149,28 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return resError(c, "invalid_sheet", 404)
 		}
 
+		reservationJson, err := redis.Bytes(kvs.Do("HGET", getKvsKeyForActiveReservations(event.ID), sheet.ID))
+		if err != nil {
+			if err == redis.ErrNil {
+				return resError(c, "not_reserved", 400)
+			}
+			return err
+		}
+		var reservation ActiveReservation
+		if err = json.Unmarshal(reservationJson, &reservation); err != nil {
+			return err
+		}
+
+		if reservation.UserID != userID {
+			return resError(c, "not_permitted", 403)
+		}
+
 		now := time.Now().UTC()
 		nowString := now.Format("2006-01-02 15:04:05")
 
 		tx, err := db.Begin()
 		if err != nil {
 			return err
-		}
-
-		var reservationID, reservationUserID int64
-		if err := tx.QueryRow("SELECT id, user_id FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL FOR UPDATE", event.ID, sheet.ID).Scan(&reservationID, &reservationUserID); err != nil {
-			tx.Rollback()
-			if err == sql.ErrNoRows {
-				return resError(c, "not_reserved", 400)
-			}
-			return err
-		}
-		if reservationUserID != userID {
-			tx.Rollback()
-			return resError(c, "not_permitted", 403)
 		}
 
 		kvs.Send("MULTI")
@@ -1144,13 +1181,19 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return err
 		}
 
-		if err := kvs.Send("ZADD", getKvsKeyForRecentReservationIDs(userID), now.UnixNano(), reservationID); err != nil {
+		if err = kvs.Send("HDEL", getKvsKeyForActiveReservations(event.ID), sheet.ID); err != nil {
 			tx.Rollback()
 			kvs.Do("DISCARD")
 			return err
 		}
 
-		if err := kvs.Send("ZADD", getKvsKeyForRecentEvents(reservationUserID), now.UnixNano(), event.ID); err != nil {
+		if err := kvs.Send("ZADD", getKvsKeyForRecentReservationIDs(userID), now.UnixNano(), reservation.ID); err != nil {
+			tx.Rollback()
+			kvs.Do("DISCARD")
+			return err
+		}
+
+		if err := kvs.Send("ZADD", getKvsKeyForRecentEvents(reservation.UserID), now.UnixNano(), event.ID); err != nil {
 			tx.Rollback()
 			kvs.Do("DISCARD")
 			return err
@@ -1162,7 +1205,7 @@ SELECT id, user_id, event_id, updated_at FROM (
 			return err
 		}
 
-		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ?, updated_at = ? WHERE id = ?", nowString, nowString, reservationID); err != nil {
+		if _, err := tx.Exec("UPDATE reservations SET canceled_at = ?, updated_at = ? WHERE id = ?", nowString, nowString, reservation.ID); err != nil {
 			tx.Rollback()
 			kvs.Do("DISCARD")
 			return err
@@ -1429,11 +1472,6 @@ func renderReportCSV(c echo.Context, kvs redis.Conn, query string, eventIDs []in
 		eventPrices[event.ID] = event.Price
 	}
 
-	rows, err := db.Query(query)
-	if err != nil {
-		return err
-	}
-
 	c.Response().Header().Set("Content-Type", `text/csv; charset=UTF-8`)
 	c.Response().Header().Set("Content-Disposition", `attachment; filename="report.csv"`)
 	_, err = c.Response().Write([]byte("reservation_id,event_id,rank,num,price,user_id,sold_at,canceled_at\n"))
@@ -1441,10 +1479,14 @@ func renderReportCSV(c echo.Context, kvs redis.Conn, query string, eventIDs []in
 		return err
 	}
 
+	rows, err := db.Query(query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
 	for rows.Next() {
 		var reservation Reservation
 		if err := rows.Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt, &reservation.UpdatedAt); err != nil {
-			rows.Close()
 			return err
 		}
 		eventPrice := eventPrices[reservation.EventID]
